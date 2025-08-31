@@ -10,9 +10,19 @@ from marilib.tui_edge import MarilibTUIEdge
 from marilib.marilib_edge import MarilibEdge
 
 
+# def on_event(event: EdgeEvent, event_data: MariNode | Frame):
+#     """An event handler for the application."""
+#     pass
+
 def on_event(event: EdgeEvent, event_data: MariNode | Frame):
-    """An event handler for the application."""
-    pass
+    if event == EdgeEvent.NODE_DATA:  # Event 3
+        frame: Frame = event_data
+        h = frame.header
+        print(
+            f"RX frame: src=0x{h.source:04X} -> dst=0x{h.destination:04X} "
+            f"type={h.type_} len={len(frame.payload)} " 
+            f"payload(hex)={frame.payload.hex()}"
+        )
 
 
 @click.command()
