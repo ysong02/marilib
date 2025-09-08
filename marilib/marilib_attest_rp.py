@@ -30,11 +30,11 @@ def mr_process_attest_verif_resp(payload):
         
         try:
             if result:
-                sig_structure_cbor_t = cbor2.dumps([1, key_id_v, node_id])
+                sig_structure_cbor_t = cbor2.dumps([node_id, 1, key_id_v])
                 public_key.verify(result_signed, sig_structure_cbor_t)
                 return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([1])
             else:
-                sig_structure_cbor_f = cbor2.dumps([0, key_id_v, node_id])
+                sig_structure_cbor_f = cbor2.dumps([node_id, 0, key_id_v])
                 public_key.verify(result_signed, sig_structure_cbor_f)
                 #print(f"result from verifier is 0")
                 return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0])

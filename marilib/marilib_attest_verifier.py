@@ -11,7 +11,7 @@ MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG = 0xE3
 # provisions 
 freshness_threshold = 8000
 node_to_key_id = {
-    795094838: 1,
+    10635067331885412150: 1,
 }
 
 swarm_public_key_list = {
