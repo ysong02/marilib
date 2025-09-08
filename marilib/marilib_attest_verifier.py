@@ -27,10 +27,10 @@ private_key_verifier = bytes.fromhex('8ed2d03fa136f5232f957e41d368940153d580e6b5
 public_key_verifier = bytes.fromhex('2463f9d5e61b84689b3b19ae10a3d6b5bfd1e69a643d7061aca4d04f7fd98db9')
 
 def mr_swarm_check_signature(signature_attester, asn_dl, version, node_id):
-    # prepare sig_structure, order: asn_dl, key_id, hash
+    # prepare sig_structure, order: asn_dl, key_id, hash, node_id
     hash_verifier = swarm_reference_value_list[version]
     key_id_to_check = node_to_key_id[node_id]
-    sig_structure = cbor2.dumps([asn_dl, key_id_to_check, hash_verifier])
+    sig_structure = cbor2.dumps([asn_dl, key_id_to_check, hash_verifier, node_id])
     
     public_key_bytes = swarm_public_key_list[key_id_to_check]
     public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
@@ -42,18 +42,18 @@ def mr_swarm_check_signature(signature_attester, asn_dl, version, node_id):
 
 def mr_swarm_generate_verification_response(result, node_id):
     if (result):
-        sig_structure_cbor = cbor2.dumps([1, key_id_v, node_id])
+        sig_structure_cbor = cbor2.dumps([node_id, 1, key_id_v])
     else:
-        sig_structure_cbor = cbor2.dumps([0, key_id_v, node_id])
+        sig_structure_cbor = cbor2.dumps([node_id, 0, key_id_v])
     private_key = Ed25519PrivateKey.from_private_bytes(private_key_verifier)
     result_signed = private_key.sign(sig_structure_cbor)
     # generate verification_response
-    verification_response = cbor2.dumps([result_signed, node_id, key_id_v])
+    verification_response = cbor2.dumps([node_id, result, key_id_v, result_signed])
     return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + verification_response
 
 def mr_swarm_verification_result(verification_request):
         asn_ul, asn_offset, evidence_cbor, node_id = cbor2.loads(verification_request)
-        version_attester, key_id_attester, signature_attester = cbor2.loads(evidence_cbor)
+        version_attester, signature_attester = cbor2.loads(evidence_cbor)
         
         # check freshness 
         if (asn_offset > freshness_threshold):
