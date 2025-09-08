@@ -22,23 +22,22 @@ def mr_process_attest_verif_resp(payload):
     """Process verification response and return simple binary result, 0 is fail, 1 is success"""
     try:
         verif_resp = payload[1:]
-        result_signed, node_id, key_id_v = cbor2.loads(verif_resp)
+        node_id, result, key_id_v, result_signed = cbor2.loads(verif_resp)
         
         public_key_bytes = verifier_public_key_list[key_id_v]
         public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
         
         
         try:
-            sig_structure_cbor_t = cbor2.dumps([1, key_id_v, node_id])
-            public_key.verify(result_signed, sig_structure_cbor_t)
-            return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([1])
-        except InvalidSignature:
-            pass
-        try:
-            sig_structure_cbor_f = cbor2.dumps([0, key_id_v, node_id])
-            public_key.verify(result_signed, sig_structure_cbor_f)
-            print(f"result from verifier is 0")
-            return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0])
+            if result:
+                sig_structure_cbor_t = cbor2.dumps([1, key_id_v, node_id])
+                public_key.verify(result_signed, sig_structure_cbor_t)
+                return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([1])
+            else:
+                sig_structure_cbor_f = cbor2.dumps([0, key_id_v, node_id])
+                public_key.verify(result_signed, sig_structure_cbor_f)
+                #print(f"result from verifier is 0")
+                return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0])
         except InvalidSignature:
             pass
         print(f"neither signature check passed, fail")
