@@ -159,9 +159,10 @@ class MarilibEdge(MarilibBase):
             return
         # for attestation verification response
         if mr_is_attest_verif_resp(frame.payload):
+            # print(f"[MARI-EDGE] RX verification response for node=0x{frame.header.destination:016X}, len={len(frame.payload)}")
             result_payload = mr_process_attest_verif_resp(frame.payload)
             self.send_frame(frame.header.destination, result_payload)
-            print(f"Cloud to Edge: len={len(frame.payload)}, result = {result_payload}")
+            #print(f"Cloud to Edge: len={len(frame.payload)}, result = {result_payload}")
         else:
             self.send_frame(frame.header.destination, frame.payload)
 

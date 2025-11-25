@@ -18,11 +18,11 @@ def on_event(event: EdgeEvent, event_data: MariNode | Frame):
     if event == EdgeEvent.NODE_DATA:  # Event 3
         frame: Frame = event_data
         h = frame.header
-        print(
-            f"RX frame: src=0x{h.source:04X} -> dst=0x{h.destination:04X} "
-            f"type={h.type_} len={len(frame.payload)} " 
-            f"payload(hex)={frame.payload.hex()}"
-        )
+        # print(
+            # f"RX frame: src=0x{h.source:04X} -> dst=0x{h.destination:04X} "
+            # f"type={h.type_} len={len(frame.\payload)} " 
+            # f"payload(hex)={frame.payload.hex()}"
+        # )
 
 
 @click.command()
@@ -76,7 +76,7 @@ def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir
             if not mari.uses_mqtt and mari.nodes:
                 mari.send_frame(MARI_BROADCAST_ADDRESS, DefaultPayload().to_bytes())
             mari.render_tui()
-            time.sleep(0.5)
+            time.sleep(0.01)
     except KeyboardInterrupt:
         pass
     finally:
