@@ -30,6 +30,7 @@ def mr_process_attest_verif_resp(payload):
         
         try:
             if result:
+                # sig_structure_cbor_t = cbor2.dumps([node_id, 1, key_id_v, asn_ul])
                 sig_structure_cbor_t = cbor2.dumps([node_id, 1, key_id_v])
                 public_key.verify(result_signed, sig_structure_cbor_t)
                 return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([1])
@@ -41,7 +42,7 @@ def mr_process_attest_verif_resp(payload):
         except InvalidSignature:
             pass
         print(f"neither signature check passed, fail")
-        return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0])
+        return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0]) 
     except Exception as e:
         print(f"Attestation verification response error: {e}")
-        return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0])
+        return bytes([MARI_ATTEST_VERIF_RESP_PAYLOAD_TAG]) + bytes([0]) 

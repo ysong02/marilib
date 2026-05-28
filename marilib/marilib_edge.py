@@ -25,7 +25,7 @@ from marilib.communication_adapter import MQTTAdapter, MQTTAdapterDummy, SerialA
 from marilib.marilib import MarilibBase
 from marilib.tui_edge import MarilibTUIEdge
 # for attestation
-from marilib.marilib_attest_rp import mr_is_attest_verif_resp, mr_process_attest_verif_resp
+# from marilib.marilib_attest_rp import mr_is_attest_verif_resp, mr_process_attest_verif_resp
 
 @dataclass
 class MarilibEdge(MarilibBase):
@@ -149,7 +149,7 @@ class MarilibEdge(MarilibBase):
             event_type = EdgeEvent(data[0])
             frame = Frame().from_bytes(data[1:])
         except (ValueError, ProtocolPayloadParserException) as exc:
-            print(f"[red]Error parsing frame: {exc}[/]")
+            # print(f"[red]Error parsing frame: {exc}[/]")
             return
         if event_type != EdgeEvent.NODE_DATA:
             return
@@ -157,14 +157,12 @@ class MarilibEdge(MarilibBase):
             frame.header.destination
         ):
             return
-        # for attestation verification response
-        if mr_is_attest_verif_resp(frame.payload):
-            # print(f"[MARI-EDGE] RX verification response for node=0x{frame.header.destination:016X}, len={len(frame.payload)}")
-            result_payload = mr_process_attest_verif_resp(frame.payload)
-            self.send_frame(frame.header.destination, result_payload)
-            #print(f"Cloud to Edge: len={len(frame.payload)}, result = {result_payload}")
-        else:
-            self.send_frame(frame.header.destination, frame.payload)
+        # # for attestation verification response (disabled)
+        # if mr_is_attest_verif_resp(frame.payload):
+        #     result_payload = mr_process_attest_verif_resp(frame.payload)
+        #     self.send_frame(frame.header.destination, result_payload)
+        # else:
+        self.send_frame(frame.header.destination, frame.payload)
 
     def handle_serial_data(self, data: bytes) -> tuple[bool, EdgeEvent, Any]:
         """
@@ -223,7 +221,24 @@ class MarilibEdge(MarilibBase):
             except (ValueError, ProtocolPayloadParserException):
                 return False, EdgeEvent.UNKNOWN, None
 
+        elif event_type == EdgeEvent.EDHOC:
+            # data: [EDHOC=6][subtype][node_id: 8 bytes][edhoc_bytes...]
+            if len(data) < 10:
+                return False, event_type, None
+            subtype = data[1]
+            node_id = int.from_bytes(data[2:10], "little")
+            edhoc_data = data[10:]
+            return True, event_type, (subtype, node_id, edhoc_data)
+
         return False, event_type, None
+
+    def send_edhoc(self, subtype: int, node_id: int | None, edhoc_data: bytes):
+        """Sends EDHOC data to the gateway. node_id is None for msg1 (broadcast)."""
+        buf = bytes([EdgeEvent.EDHOC, subtype])
+        if node_id is not None:
+            buf += node_id.to_bytes(8, "little")
+        buf += edhoc_data
+        self.serial_interface.send_data(buf)
 
     def on_serial_data_received(self, data: bytes):
         res, event_type, event_data = self.handle_serial_data(data)
@@ -238,8 +253,14 @@ class MarilibEdge(MarilibBase):
                 self.setup_params["schedule_name"] = self.gateway.info.schedule_name
                 self.logger.log_setup_parameters(self.setup_params)
 
+        if event_type in [EdgeEvent.NODE_JOINED, EdgeEvent.NODE_LEFT]:
+            self.cb_application(event_type, event_data)
+
         if event_type == EdgeEvent.NODE_DATA and not event_data.is_test_packet:
             # only notify the application if it's not a test packet
+            self.cb_application(event_type, event_data)
+
+        if event_type == EdgeEvent.EDHOC:
             self.cb_application(event_type, event_data)
 
         self.send_data_to_cloud(event_type, event_data)
@@ -247,6 +268,8 @@ class MarilibEdge(MarilibBase):
     def send_data_to_cloud(
         self, event_type: EdgeEvent, event_data: NodeInfoEdge | GatewayInfo | Frame
     ):
+        if event_type == EdgeEvent.EDHOC:
+            return  # EDHOC is handled locally, not forwarded to cloud
         if event_type in [EdgeEvent.NODE_JOINED, EdgeEvent.NODE_LEFT, EdgeEvent.NODE_KEEP_ALIVE]:
             event_data = event_data.to_cloud(self.gateway.info.address)
         data = EdgeEvent.to_bytes(event_type) + event_data.to_bytes()

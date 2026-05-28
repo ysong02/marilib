@@ -96,7 +96,7 @@ class MetricsTester:
                 return
 
         except Exception as e:
-            print(f"[red]Error parsing metrics response: {e}[/]")
+            # print(f"[red]Error parsing metrics response: {e}[/]")
             return
 
         payload.edge_rx_ts_us = self.timestamp_us()
@@ -129,7 +129,7 @@ class MetricsTester:
                 return
 
         except Exception as e:
-            print(f"[red]Error parsing metrics response: {e}[/]")
+            # print(f"[red]Error parsing metrics response: {e}[/]")
             return
 
         payload.cloud_rx_ts_us = self.timestamp_us()

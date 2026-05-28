@@ -71,6 +71,7 @@ class EdgeEvent(IntEnum):
     NODE_DATA = 3
     NODE_KEEP_ALIVE = 4
     GATEWAY_INFO = 5
+    EDHOC = 6
     UNKNOWN = 255
 
     @classmethod
