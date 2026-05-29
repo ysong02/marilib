@@ -80,11 +80,13 @@ def on_event(
     """Application event handler, extended to process EDHOC events."""
     if event == EdgeEvent.NODE_JOINED:
         node_state["joined"].add(event_data.address)
+        # Clear edhoc_done on rejoin so a reconnecting node can complete EDHOC again.
+        node_state["edhoc_done"].discard(event_data.address)
         # _print_status(node_state)
 
     elif event == EdgeEvent.NODE_LEFT:
         node_state["joined"].discard(event_data.address)
-        node_state["edhoc_done"].discard(event_data.address)
+        # Do NOT clear edhoc_done: the node completed the handshake, that fact persists.
         # _print_status(node_state)
 
     elif event == EdgeEvent.NODE_DATA:
@@ -128,9 +130,8 @@ def on_event(
                 return
             try:
                 _ead_4 = session.process_message_4(edhoc_bytes)
-                if node_id in node_state["joined"]:
-                    node_state["edhoc_done"].add(node_id)
-                    # _print_status(node_state)
+                node_state["edhoc_done"].add(node_id)
+                # _print_status(node_state)
             except Exception as e:
                 print(f"[EDHOC] ERROR: msg4 failed for node 0x{node_id:016X}: {e}")
 
