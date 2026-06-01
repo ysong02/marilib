@@ -268,6 +268,38 @@ key_id_v = 5
 private_key_verifier = bytes.fromhex('8ed2d03fa136f5232f957e41d368940153d580e6b5ea57b68aa8836ff9539010')
 public_key_verifier = bytes.fromhex('2463f9d5e61b84689b3b19ae10a3d6b5bfd1e69a643d7061aca4d04f7fd98db9')
 
+def mr_swarm_verification_result_edhoc(payload):
+    """Verify attestation evidence received via EDHOC EAD4.
+
+    payload[0] == 0xE4; payload[1:] is CBOR [asn_dl, evidence_cbor, node_id, attestation_binder]
+    evidence_cbor is CBOR [fw_version, key_id, signature]
+    signature covers CBOR [asn_dl, key_id, hash_firmware, node_id, attestation_binder]
+    Returns True if verification passes.
+    """
+    asn_dl, evidence_cbor, node_id, attestation_binder = cbor2.loads(payload[1:])
+    fw_version, key_id, signature = cbor2.loads(evidence_cbor)
+
+    hash_ref = swarm_reference_value_list.get(key_id)
+    if hash_ref is None:
+        print(f"[VERIFIER] Unknown key_id={key_id} for node=0x{node_id:016X}")
+        return False
+
+    public_key_bytes = swarm_public_key_list.get(key_id)
+    if public_key_bytes is None:
+        print(f"[VERIFIER] No public key for key_id={key_id}")
+        return False
+
+    sig_structure = cbor2.dumps([asn_dl, key_id, hash_ref, node_id, attestation_binder])
+    public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+    try:
+        public_key.verify(bytes(signature), sig_structure)
+        print(f"[VERIFIER] Attestation PASSED for node=0x{node_id:016X}, fw_version={fw_version}, asn_dl={asn_dl}")
+        return True
+    except InvalidSignature:
+        print(f"[VERIFIER] Attestation FAILED for node=0x{node_id:016X}")
+        return False
+
+
 def mr_swarm_check_signature(signature_attester, asn_dl, version, node_id):
     # prepare sig_structure, order: asn_dl, key_id, hash, node_id
     hash_verifier = swarm_reference_value_list[version]

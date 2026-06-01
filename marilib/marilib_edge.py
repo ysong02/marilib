@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 from rich import print
+import cbor2
 
 from marilib.metrics import MetricsTester
 from marilib.mari_protocol import (
@@ -12,6 +13,9 @@ from marilib.mari_protocol import (
     DefaultPayload,
     DefaultPayloadType,
 )
+
+# EDHOC subtype for MSG4 (mirror of MARI_EDHOC_SUBTYPE_MSG4 in models.h)
+_EDHOC_MSG4 = 4
 from marilib.model import (
     EdgeEvent,
     GatewayInfo,
@@ -222,13 +226,22 @@ class MarilibEdge(MarilibBase):
                 return False, EdgeEvent.UNKNOWN, None
 
         elif event_type == EdgeEvent.EDHOC:
-            # data: [EDHOC=6][subtype][node_id: 8 bytes][edhoc_bytes...]
+            # data: [EDHOC=6][subtype][node_id: 8 bytes][...]
+            # MSG4 format: [EDHOC=6][MSG4=4][node_id: 8 bytes][asn_dl: 8 bytes][edhoc_bytes...]
+            # other subtypes: [EDHOC=6][subtype][node_id: 8 bytes][edhoc_bytes...]
             if len(data) < 10:
                 return False, event_type, None
             subtype = data[1]
             node_id = int.from_bytes(data[2:10], "little")
-            edhoc_data = data[10:]
-            return True, event_type, (subtype, node_id, edhoc_data)
+            if subtype == _EDHOC_MSG4:
+                if len(data) < 18:
+                    return False, event_type, None
+                asn_dl = int.from_bytes(data[10:18], "little")
+                edhoc_data = data[18:]
+            else:
+                asn_dl = 0
+                edhoc_data = data[10:]
+            return True, event_type, (subtype, node_id, edhoc_data, asn_dl)
 
         return False, event_type, None
 
@@ -239,6 +252,13 @@ class MarilibEdge(MarilibBase):
             buf += node_id.to_bytes(8, "little")
         buf += edhoc_data
         self.serial_interface.send_data(buf)
+
+    def send_attestation_to_cloud(self, node_id: int, asn_dl: int, evidence_cbor: bytes, attestation_binder: bytes):
+        """Forwards attestation evidence extracted from EDHOC EAD4 to the cloud verifier via MQTT."""
+        payload = bytes([0xE4]) + cbor2.dumps([asn_dl, evidence_cbor, node_id, attestation_binder])
+        frame = Frame(Header(source=node_id, destination=self.gateway.info.address), payload=payload)
+        data = EdgeEvent.to_bytes(EdgeEvent.NODE_DATA) + frame.to_bytes()
+        self.mqtt_interface.send_data_to_cloud(data)
 
     def on_serial_data_received(self, data: bytes):
         res, event_type, event_data = self.handle_serial_data(data)

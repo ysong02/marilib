@@ -10,7 +10,7 @@ from marilib.communication_adapter import MQTTAdapter
 from marilib.tui_cloud import MarilibTUICloud
 from marilib.logger import MetricsLogger
 
-from marilib.marilib_attest_verifier import mr_swarm_verification_result
+from marilib.marilib_attest_verifier import mr_swarm_verification_result_edhoc
 
 NORMAL_DATA_PAYLOAD = b"NORMAL_APP_DATA"
 mari_instance = None
@@ -19,33 +19,14 @@ verification_queue = queue.Queue()
 verification_stats = {
     'received': 0,
     'processed': 0,
+    'succeeded': 0,
     'failed': 0,
     'ignored': 0  # Non-attestation packets
 }
 
 def is_attestation_request(payload):
-    """Check if payload is an attestation verification request."""
-    if len(payload) < 4:
-        return False
-    
-    # Attestation requests are CBOR arrays starting with 0x84
-    # and contain asn_ul, asn_offset, evidence_cbor, node_id
-    try:
-        import cbor2
-        data = cbor2.loads(payload)
-        
-        # Should be a 4 element array
-        if not isinstance(data, list) or len(data) != 4:
-            return False
-        
-        # Basic structure check: [asn_ul (int), asn_offset (int), evidence_cbor (bytes), node_id (int)]
-        if not (isinstance(data[0], int) and isinstance(data[1], int) and 
-                isinstance(data[2], bytes) and isinstance(data[3], int)):
-            return False
-        
-        return True
-    except:
-        return False
+    """Check if payload is an EDHOC attestation request (0xE4 tag)."""
+    return len(payload) >= 1 and payload[0] == 0xE4
 
 def verification_worker():
     """Worker thread that processes verification requests one by one."""
@@ -62,16 +43,17 @@ def verification_worker():
             print(f"Processing request from node=0x{node_id:04X}, queue_size={verification_queue.qsize()}")
             
             try:
-                # Perform verification
-                verification_response = mr_swarm_verification_result(payload)
-                
-                print(f"Verification SUCCESS for node=0x{node_id:04X}, response_len={len(verification_response)}")
-                
-                # Send response back
-                mari_instance.send_frame(node_id, verification_response)
-                
+                # Perform verification (EDHOC-based, no response sent back to node)
+                result = mr_swarm_verification_result_edhoc(payload)
+
                 verification_stats['processed'] += 1
-                print(f"Stats: received={verification_stats['received']}, processed={verification_stats['processed']}, failed={verification_stats['failed']}, ignored={verification_stats['ignored']}")
+                if result:
+                    verification_stats['succeeded'] += 1
+                else:
+                    verification_stats['failed'] += 1
+
+                s = verification_stats
+                print(f"[VERIFIER] Summary: {s['processed']} evaluated, {s['succeeded']} succeeded, {s['failed']} failed (of {s['received']} received)")
                 
             except Exception as e:
                 print(f"ERROR processing node=0x{node_id:04X}: {e}")
@@ -168,12 +150,14 @@ def main(mqtt_url: str, network_id: int, send_periodic: float, log_dir: str):
             mari_instance.render_tui()
             time.sleep(0.01)
     except KeyboardInterrupt:
+        s = verification_stats
         print(f"\n[VERIFIER] Shutting down. Final stats:")
-        print(f"  - Attestation requests received: {verification_stats['received']}")
-        print(f"  - Successfully processed: {verification_stats['processed']}")
-        print(f"  - Failed: {verification_stats['failed']}")
-        print(f"  - Non-attestation packets ignored: {verification_stats['ignored']}")
-        print(f"  - Queue remaining: {verification_queue.qsize()}")
+        print(f"  - Attestation requests received : {s['received']}")
+        print(f"  - Evaluated                     : {s['processed']}")
+        print(f"  - Succeeded                     : {s['succeeded']}")
+        print(f"  - Failed                        : {s['failed']}")
+        print(f"  - Non-attestation ignored       : {s['ignored']}")
+        print(f"  - Queue remaining               : {verification_queue.qsize()}")
     finally:
         mari_instance.close_tui()
         mari_instance.logger.close()

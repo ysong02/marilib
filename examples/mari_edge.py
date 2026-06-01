@@ -93,7 +93,7 @@ def on_event(
         pass  # application logic here
 
     elif event == EdgeEvent.EDHOC:
-        subtype, node_id, edhoc_bytes = event_data
+        subtype, node_id, edhoc_bytes, asn_dl = event_data
 
         if subtype == EDHOC_MSG2:
             session = None
@@ -129,9 +129,21 @@ def on_event(
                 # print(f"[EDHOC] ERROR: no session for node 0x{node_id:016X}, ignoring msg4")
                 return
             try:
-                _ead_4 = session.process_message_4(edhoc_bytes)
+                ead_4 = session.process_message_4(edhoc_bytes)
+                attestation_binder = session.edhoc_exporter(2, b'attestation', 32)
                 node_state["edhoc_done"].add(node_id)
                 # _print_status(node_state)
+
+                # forward attestation evidence from EAD4 to cloud verifier
+                if ead_4 is not None:
+                    evidence_cbor = ead_4.value()
+                    if evidence_cbor is not None:
+                        mari.send_attestation_to_cloud(node_id, asn_dl, evidence_cbor, attestation_binder)
+                        print(f"[ATTEST] Evidence forwarded to verifier for node 0x{node_id:016X} (asn_dl={asn_dl})")
+                    else:
+                        print(f"[ATTEST] WARNING: EAD4 present but value is empty for node 0x{node_id:016X}")
+                else:
+                    print(f"[ATTEST] WARNING: no EAD4 in msg4 from node 0x{node_id:016X}")
             except Exception as e:
                 print(f"[EDHOC] ERROR: msg4 failed for node 0x{node_id:016X}: {e}")
 
