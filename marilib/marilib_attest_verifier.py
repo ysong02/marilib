@@ -271,13 +271,19 @@ public_key_verifier = bytes.fromhex('2463f9d5e61b84689b3b19ae10a3d6b5bfd1e69a643
 def mr_swarm_verification_result_edhoc(payload):
     """Verify attestation evidence received via EDHOC EAD4.
 
-    payload[0] == 0xE4; payload[1:] is CBOR [asn_dl, evidence_cbor, node_id, attestation_binder]
+    payload[0] == 0xE4; payload[1:] is CBOR [asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder]
     evidence_cbor is CBOR [fw_version, key_id, signature]
     signature covers CBOR [asn_dl, key_id, hash_firmware, node_id, attestation_binder]
     Returns True if verification passes.
     """
-    asn_dl, evidence_cbor, node_id, attestation_binder = cbor2.loads(payload[1:])
+    asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder = cbor2.loads(payload[1:])
     fw_version, key_id, signature = cbor2.loads(evidence_cbor)
+
+    # Freshness check: asn_ul is when msg4 was received, asn_dl is when msg3 was sent
+    asn_offset = asn_ul - asn_dl
+    if asn_offset > freshness_threshold:
+        print(f"[VERIFIER] Attestation STALE for node=0x{node_id:016X}: asn_offset={asn_offset} > threshold={freshness_threshold}")
+        return False
 
     hash_ref = swarm_reference_value_list.get(key_id)
     if hash_ref is None:
@@ -293,10 +299,10 @@ def mr_swarm_verification_result_edhoc(payload):
     public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
     try:
         public_key.verify(bytes(signature), sig_structure)
-        print(f"[VERIFIER] Attestation PASSED for node=0x{node_id:016X}, fw_version={fw_version}, asn_dl={asn_dl}")
+        print(f"[VERIFIER] Attestation PASSED for node=0x{node_id:016X}, fw_version={fw_version}, asn_dl={asn_dl}, asn_ul={asn_ul}, offset={asn_offset}")
         return True
     except InvalidSignature:
-        print(f"[VERIFIER] Attestation FAILED for node=0x{node_id:016X}")
+        print(f"[VERIFIER] Attestation FAILED (bad signature) for node=0x{node_id:016X}")
         return False
 
 

@@ -227,21 +227,23 @@ class MarilibEdge(MarilibBase):
 
         elif event_type == EdgeEvent.EDHOC:
             # data: [EDHOC=6][subtype][node_id: 8 bytes][...]
-            # MSG4 format: [EDHOC=6][MSG4=4][node_id: 8 bytes][asn_dl: 8 bytes][edhoc_bytes...]
+            # MSG4 format: [EDHOC=6][MSG4=4][node_id: 8 bytes][asn_dl: 8 bytes][asn_ul: 8 bytes][edhoc_bytes...]
             # other subtypes: [EDHOC=6][subtype][node_id: 8 bytes][edhoc_bytes...]
             if len(data) < 10:
                 return False, event_type, None
             subtype = data[1]
             node_id = int.from_bytes(data[2:10], "little")
             if subtype == _EDHOC_MSG4:
-                if len(data) < 18:
+                if len(data) < 26:
                     return False, event_type, None
                 asn_dl = int.from_bytes(data[10:18], "little")
-                edhoc_data = data[18:]
+                asn_ul = int.from_bytes(data[18:26], "little")
+                edhoc_data = data[26:]
             else:
                 asn_dl = 0
+                asn_ul = 0
                 edhoc_data = data[10:]
-            return True, event_type, (subtype, node_id, edhoc_data, asn_dl)
+            return True, event_type, (subtype, node_id, edhoc_data, asn_dl, asn_ul)
 
         return False, event_type, None
 
@@ -253,9 +255,9 @@ class MarilibEdge(MarilibBase):
         buf += edhoc_data
         self.serial_interface.send_data(buf)
 
-    def send_attestation_to_cloud(self, node_id: int, asn_dl: int, evidence_cbor: bytes, attestation_binder: bytes):
+    def send_attestation_to_cloud(self, node_id: int, asn_dl: int, asn_ul: int, evidence_cbor: bytes, attestation_binder: bytes):
         """Forwards attestation evidence extracted from EDHOC EAD4 to the cloud verifier via MQTT."""
-        payload = bytes([0xE4]) + cbor2.dumps([asn_dl, evidence_cbor, node_id, attestation_binder])
+        payload = bytes([0xE4]) + cbor2.dumps([asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder])
         frame = Frame(Header(source=node_id, destination=self.gateway.info.address), payload=payload)
         data = EdgeEvent.to_bytes(EdgeEvent.NODE_DATA) + frame.to_bytes()
         self.mqtt_interface.send_data_to_cloud(data)

@@ -39,8 +39,8 @@ def verification_worker():
             
             node_id = frame.header.source
             payload = frame.payload
-            
-            print(f"Processing request from node=0x{node_id:04X}, queue_size={verification_queue.qsize()}")
+
+            print(f"[VERIFIER] Processing attestation from node=0x{node_id:016X}, payload={len(payload)} B")
             
             try:
                 # Perform verification (EDHOC-based, no response sent back to node)
@@ -87,8 +87,8 @@ def on_event(event: EdgeEvent, event_data: MariNode | Frame | GatewayInfo):
         # This is an attestation request
         verification_stats['received'] += 1
         verification_queue.put(frame)
-        
-        print(f"[VERIFIER] Queued attestation request from node=0x{h.source:04X}, queue_size={verification_queue.qsize()}")
+
+        print(f"[VERIFIER] Received from node=0x{h.source:016X}, payload={len(p)} B, queue_size={verification_queue.qsize()}")
 
 @click.command()
 @click.option(

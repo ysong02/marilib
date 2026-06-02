@@ -1,5 +1,6 @@
 import time
 
+import cbor2
 import click
 import lakers
 from lakers import EdhocInitiator, CredentialTransfer
@@ -17,6 +18,9 @@ EDHOC_MSG1 = 1
 EDHOC_MSG2 = 2
 EDHOC_MSG3 = 3
 EDHOC_MSG4 = 4
+
+MSG3_RETRY_INTERVAL = 5.0   # seconds between msg3 retries
+MSG3_MAX_RETRIES    = 10    # max msg3 retry attempts per node
 
 # Initiator (edge) static private DH key (matches I[0] in 03app_dotbot.c)
 I = bytes([
@@ -51,8 +55,8 @@ CRED_R = bytes([
 EDHOC_MSG1_RESEND_INTERVAL = 300.0
 
 
-def _init_edhoc() -> tuple[EdhocInitiator, bytes]:
-    """Create a fresh EdhocInitiator and generate message 1."""
+def _init_edhoc(mari: MarilibEdge) -> tuple[EdhocInitiator, bytes]:
+    """Create a fresh EdhocInitiator and generate message 1 (no EAD_1)."""
     initiator = EdhocInitiator()
     msg1 = initiator.prepare_message_1(c_i=None, ead_1=None)
     return initiator, msg1
@@ -86,6 +90,7 @@ def on_event(
 
     elif event == EdgeEvent.NODE_LEFT:
         node_state["joined"].discard(event_data.address)
+        edhoc_state["pending_msg3"].pop(event_data.address, None)
         # Do NOT clear edhoc_done: the node completed the handshake, that fact persists.
         # _print_status(node_state)
 
@@ -93,7 +98,7 @@ def on_event(
         pass  # application logic here
 
     elif event == EdgeEvent.EDHOC:
-        subtype, node_id, edhoc_bytes, asn_dl = event_data
+        subtype, node_id, edhoc_bytes, asn_dl, asn_ul = event_data
 
         if subtype == EDHOC_MSG2:
             session = None
@@ -121,9 +126,12 @@ def on_event(
                 return
 
             edhoc_state["sessions"][node_id] = session
+            edhoc_state["pending_msg3"][node_id] = (msg3, time.time(), 0)
             mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
+            print(f"[EDHOC] msg3 ({len(msg3)} B): {msg3.hex()} → node 0x{node_id:016X}")
 
         elif subtype == EDHOC_MSG4:
+            edhoc_state["pending_msg3"].pop(node_id, None)
             session = edhoc_state["sessions"].pop(node_id, None)
             if session is None:
                 # print(f"[EDHOC] ERROR: no session for node 0x{node_id:016X}, ignoring msg4")
@@ -138,8 +146,11 @@ def on_event(
                 if ead_4 is not None:
                     evidence_cbor = ead_4.value()
                     if evidence_cbor is not None:
-                        mari.send_attestation_to_cloud(node_id, asn_dl, evidence_cbor, attestation_binder)
-                        print(f"[ATTEST] Evidence forwarded to verifier for node 0x{node_id:016X} (asn_dl={asn_dl})")
+                        attest_cbor = cbor2.dumps([asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder])
+                        attest_total = 1 + len(attest_cbor)  # 0xE4 tag + CBOR body
+                        mari.send_attestation_to_cloud(node_id, asn_dl, asn_ul, evidence_cbor, attestation_binder)
+                        print(f"[ATTEST] → verifier: node=0x{node_id:016X}, asn_dl={asn_dl}, asn_ul={asn_ul}, offset={asn_ul - asn_dl}")
+                        print(f"[ATTEST]   evidence={len(evidence_cbor)} B, binder={len(attestation_binder)} B, total={attest_total} B")
                     else:
                         print(f"[ATTEST] WARNING: EAD4 present but value is empty for node 0x{node_id:016X}")
                 else:
@@ -187,6 +198,7 @@ def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir
         "msg1": None,
         "sessions": {},
         "last_msg1_sent": 0.0,
+        "pending_msg3": {},  # node_id → (msg3_bytes, last_sent_ts, retry_count)
     }
 
     node_state: dict = {
@@ -210,11 +222,12 @@ def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir
     )
 
     # Generate EDHOC msg1 and send to gateway for beacon broadcast
-    initiator, msg1 = _init_edhoc()
+    initiator, msg1 = _init_edhoc(mari)
     edhoc_state["initiator"] = initiator
     edhoc_state["msg1"] = msg1
     mari.send_edhoc(EDHOC_MSG1, None, msg1)
     edhoc_state["last_msg1_sent"] = time.time()
+    print(f"[EDHOC] msg1 ({len(msg1)} B): {msg1.hex()}")
 
     last_status_print = 0.0
 
@@ -233,17 +246,32 @@ def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir
                     print(f"  EDHOC done: {', '.join(f'0x{n:016X}' for n in sorted(done))}")
                 last_status_print = now
 
+            # Retry msg3 for joined nodes that haven't completed EDHOC yet.
+            for node_id, (msg3, last_sent, retry_count) in list(edhoc_state["pending_msg3"].items()):
+                if node_id not in node_state["joined"]:
+                    edhoc_state["pending_msg3"].pop(node_id, None)
+                    continue
+                if retry_count >= MSG3_MAX_RETRIES:
+                    edhoc_state["pending_msg3"].pop(node_id, None)
+                    print(f"[EDHOC] msg3 retry limit reached for node 0x{node_id:016X}, giving up")
+                    continue
+                if now - last_sent >= MSG3_RETRY_INTERVAL:
+                    mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
+                    edhoc_state["pending_msg3"][node_id] = (msg3, now, retry_count + 1)
+                    print(f"[EDHOC] msg3 retry #{retry_count + 1}/{MSG3_MAX_RETRIES} → node 0x{node_id:016X}")
+
             # Rotate msg1: fresh ephemeral key, gateway overwrites old bytes next beacon.
             # Previous initiator is kept one cycle as fallback for late-arriving msg2.
             # Do NOT clear sessions: nodes that already have msg3 in flight must still be
             # able to complete with msg4.  Sessions are removed individually when msg4 arrives.
             if now - edhoc_state["last_msg1_sent"] >= EDHOC_MSG1_RESEND_INTERVAL:
-                initiator, msg1 = _init_edhoc()
+                initiator, msg1 = _init_edhoc(mari)
                 edhoc_state["prev_initiator"] = edhoc_state["initiator"]
                 edhoc_state["initiator"] = initiator
                 edhoc_state["msg1"] = msg1
                 mari.send_edhoc(EDHOC_MSG1, None, msg1)
                 edhoc_state["last_msg1_sent"] = now
+                print(f"[EDHOC] msg1 rotated ({len(msg1)} B): {msg1.hex()}")
 
             time.sleep(0.001)
     except KeyboardInterrupt:
