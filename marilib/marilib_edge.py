@@ -149,11 +149,21 @@ class MarilibEdge(MarilibBase):
 
         self.last_received_mqtt_data_ts = datetime.now()
 
+        # Handle kick command from cloud verifier
         try:
             event_type = EdgeEvent(data[0])
+        except ValueError:
+            return
+
+        if event_type == EdgeEvent.KICK_NODE:
+            if len(data) >= 9:
+                node_id = int.from_bytes(data[1:9], "little")
+                self._send_kick_to_gateway(node_id)
+            return
+
+        try:
             frame = Frame().from_bytes(data[1:])
-        except (ValueError, ProtocolPayloadParserException) as exc:
-            # print(f"[red]Error parsing frame: {exc}[/]")
+        except ProtocolPayloadParserException:
             return
         if event_type != EdgeEvent.NODE_DATA:
             return
@@ -167,6 +177,11 @@ class MarilibEdge(MarilibBase):
         #     self.send_frame(frame.header.destination, result_payload)
         # else:
         self.send_frame(frame.header.destination, frame.payload)
+
+    def _send_kick_to_gateway(self, node_id: int):
+        """Send a kick command to the gateway to remove a node from the schedule."""
+        buf = bytes([EdgeEvent.KICK_NODE]) + node_id.to_bytes(8, "little")
+        self.serial_interface.send_data(buf)
 
     def handle_serial_data(self, data: bytes) -> tuple[bool, EdgeEvent, Any]:
         """

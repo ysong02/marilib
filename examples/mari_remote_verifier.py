@@ -43,7 +43,6 @@ def verification_worker():
             print(f"[VERIFIER] Processing attestation from node=0x{node_id:016X}, payload={len(payload)} B")
             
             try:
-                # Perform verification (EDHOC-based, no response sent back to node)
                 result = mr_swarm_verification_result_edhoc(payload)
 
                 verification_stats['processed'] += 1
@@ -51,6 +50,9 @@ def verification_worker():
                     verification_stats['succeeded'] += 1
                 else:
                     verification_stats['failed'] += 1
+                    if mari_instance.mqtt_interface is not None:
+                        mari_instance.kick_node(node_id)
+                        print(f"[VERIFIER] Kicked node=0x{node_id:016X} (attestation failed)")
 
                 s = verification_stats
                 print(f"[VERIFIER] Summary: {s['processed']} evaluated, {s['succeeded']} succeeded, {s['failed']} failed (of {s['received']} received)")

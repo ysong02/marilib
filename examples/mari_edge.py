@@ -239,11 +239,8 @@ def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir
 
             # Print a status summary every 5 seconds so progress is visible without flooding.
             if now - last_status_print >= 5.0:
-                joined = node_state["joined"]
-                done   = node_state["edhoc_done"]
-                print(f"[STATUS] {len(joined)} joined, {len(done)} EDHOC complete")
-                if done:
-                    print(f"  EDHOC done: {', '.join(f'0x{n:016X}' for n in sorted(done))}")
+                done = node_state["edhoc_done"]
+                print(f"[STATUS] {len(done)} EDHOC complete")
                 last_status_print = now
 
             # Retry msg3 for joined nodes that haven't completed EDHOC yet.

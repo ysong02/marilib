@@ -102,6 +102,11 @@ class MarilibCloud(MarilibBase):
             EdgeEvent.to_bytes(EdgeEvent.NODE_DATA) + mari_frame.to_bytes()
         )
 
+    def kick_node(self, node_id: int):
+        """Tell the edge/gateway to remove a node from the schedule (e.g., on attestation failure)."""
+        data = EdgeEvent.to_bytes(EdgeEvent.KICK_NODE) + node_id.to_bytes(8, "little")
+        self.mqtt_interface.send_data_to_edge(data)
+
     def render_tui(self):
         if self.tui:
             self.tui.render(self)
