@@ -107,6 +107,11 @@ class MarilibCloud(MarilibBase):
         data = EdgeEvent.to_bytes(EdgeEvent.KICK_NODE) + node_id.to_bytes(8, "little")
         self.mqtt_interface.send_data_to_edge(data)
 
+    def send_attest_result(self, node_id: int, result: bool):
+        """Send attestation result (pass or fail) to the edge for logging and kick-on-fail."""
+        data = EdgeEvent.to_bytes(EdgeEvent.ATTEST_RESULT) + node_id.to_bytes(8, "little") + bytes([1 if result else 0])
+        self.mqtt_interface.send_data_to_edge(data)
+
     def render_tui(self):
         if self.tui:
             self.tui.render(self)

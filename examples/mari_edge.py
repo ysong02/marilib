@@ -1,4 +1,7 @@
+import csv
+import os
 import time
+from datetime import datetime
 
 import cbor2
 import click
@@ -19,8 +22,8 @@ EDHOC_MSG2 = 2
 EDHOC_MSG3 = 3
 EDHOC_MSG4 = 4
 
-MSG3_RETRY_INTERVAL = 5.0   # seconds between msg3 retries
-MSG3_MAX_RETRIES    = 10    # max msg3 retry attempts per node
+MSG3_RETRY_INTERVAL = 2.0   # seconds between msg3 retries (must be < node's MSG3_TIMEOUT_SLOTS ≈ 6s)
+MSG3_MAX_RETRIES    = 30    # max msg3 retry attempts per node
 
 # Initiator (edge) static private DH key (matches I[0] in 03app_dotbot.c)
 I = bytes([
@@ -51,7 +54,6 @@ CRED_R = bytes([
 ])
 
 # How often to rotate msg1 (new ephemeral key for forward secrecy).
-# Must be longer than the worst-case EDHOC exchange time (beacon interval * join latency).
 EDHOC_MSG1_RESEND_INTERVAL = 300.0
 
 
@@ -62,16 +64,12 @@ def _init_edhoc(mari: MarilibEdge) -> tuple[EdhocInitiator, bytes]:
     return initiator, msg1
 
 
-def _print_status(node_state: dict) -> None:
-    # Uncomment to print a status summary after each join/leave/EDHOC event.
-    # joined = node_state["joined"]
-    # done   = node_state["edhoc_done"]
-    # print(f"[STATUS] {len(joined)} joined, {len(done)} EDHOC complete")
-    # if joined:
-    #     print(f"  joined      : {', '.join(f'0x{n:016X}' for n in sorted(joined))}")
-    # if done:
-    #     print(f"  EDHOC done  : {', '.join(f'0x{n:016X}' for n in sorted(done))}")
-    pass
+def _csv_path_for_run(eval_log: str, run: int, runs: int) -> str:
+    """Return the CSV path for a given run number (numbered only when runs > 1)."""
+    if runs == 1:
+        return eval_log
+    stem, ext = os.path.splitext(eval_log)
+    return f"{stem}_{run:03d}{ext or '.csv'}"
 
 
 def on_event(
@@ -80,27 +78,47 @@ def on_event(
     mari: MarilibEdge,
     edhoc_state: dict,
     node_state: dict,
+    eval_state: dict,
+    target_nodes: int,
 ):
-    """Application event handler, extended to process EDHOC events."""
+    """Application event handler — eval_state['writer'] holds the current CSV writer."""
+    writer = eval_state["writer"]
+
     if event == EdgeEvent.NODE_JOINED:
         node_state["joined"].add(event_data.address)
-        # Clear edhoc_done on rejoin so a reconnecting node can complete EDHOC again.
         node_state["edhoc_done"].discard(event_data.address)
-        # _print_status(node_state)
 
     elif event == EdgeEvent.NODE_LEFT:
         node_state["joined"].discard(event_data.address)
         edhoc_state["pending_msg3"].pop(event_data.address, None)
-        # Do NOT clear edhoc_done: the node completed the handshake, that fact persists.
-        # _print_status(node_state)
+
+    elif event == EdgeEvent.ATTEST_RESULT:
+        if not eval_state["accepting_results"]:
+            return  # round not active — discard late results from verifier backlog
+        node_id, result = event_data
+        if node_id in node_state["attest_done_nodes"]:
+            return  # duplicate result for this node, ignore
+        node_state["attest_done_nodes"].add(node_id)
+        ts = time.time()
+        elapsed = ts - eval_state["t0"] if eval_state["t0"] else 0.0
+        writer.writerow(["attest_result", f"{ts:.6f}", f"0x{node_id:016X}", str(result)])
+        count = len(node_state["attest_done_nodes"])
+        run_label = f"run {eval_state['run']}/{eval_state['total_runs']}  " if eval_state["total_runs"] > 1 else ""
+        print(f"[EVAL] {run_label}Attest node=0x{node_id:016X} result={result} at +{elapsed:.1f}s  ({count}/{target_nodes})")
+        if count == target_nodes:
+            print(f"[EVAL] *** ALL {target_nodes} ATTESTATIONS DONE in {elapsed:.1f}s ***")
+            eval_state["accepting_results"] = False
+            eval_state["done"] = True
 
     elif event == EdgeEvent.NODE_DATA:
-        pass  # application logic here
+        pass
 
     elif event == EdgeEvent.EDHOC:
         subtype, node_id, edhoc_bytes, asn_dl, asn_ul = event_data
 
         if subtype == EDHOC_MSG2:
+            if not (10 <= len(edhoc_bytes) <= 200):
+                return  # obviously corrupted length — drop before lakers sees it
             session = None
             for src_initiator in [edhoc_state["initiator"], edhoc_state["prev_initiator"]]:
                 if src_initiator is None:
@@ -112,170 +130,206 @@ def on_event(
                     candidate.verify_message_2(I, CRED_I, valid_cred_r)
                     session = candidate
                     break
-                except Exception:
-                    pass
+                except BaseException:
+                    # Rust panic on corrupted packet — the clone panicked, not the
+                    # original initiator, so src_initiator is still valid. Just skip
+                    # this corrupted msg2 and let the thread continue normally.
+                    break
 
             if session is None:
-                print(f"[EDHOC] ERROR: msg2 rejected for node 0x{node_id:016X}, no matching session")
                 return
 
             try:
                 msg3, _prk_out = session.prepare_message_3(CredentialTransfer.ByReference, None)
-            except Exception as e:
-                print(f"[EDHOC] ERROR: prepare_message_3 failed for node 0x{node_id:016X}: {e}")
+            except BaseException:
                 return
 
             edhoc_state["sessions"][node_id] = session
             edhoc_state["pending_msg3"][node_id] = (msg3, time.time(), 0)
             mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
-            print(f"[EDHOC] msg3 ({len(msg3)} B): {msg3.hex()} → node 0x{node_id:016X}")
 
         elif subtype == EDHOC_MSG4:
             edhoc_state["pending_msg3"].pop(node_id, None)
             session = edhoc_state["sessions"].pop(node_id, None)
             if session is None:
-                # print(f"[EDHOC] ERROR: no session for node 0x{node_id:016X}, ignoring msg4")
                 return
             try:
                 ead_4 = session.process_message_4(edhoc_bytes)
                 attestation_binder = session.edhoc_exporter(2, b'attestation', 32)
                 node_state["edhoc_done"].add(node_id)
-                # _print_status(node_state)
 
-                # forward attestation evidence from EAD4 to cloud verifier
                 if ead_4 is not None:
                     evidence_cbor = ead_4.value()
                     if evidence_cbor is not None:
                         attest_cbor = cbor2.dumps([asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder])
-                        attest_total = 1 + len(attest_cbor)  # 0xE4 tag + CBOR body
+                        attest_total = 1 + len(attest_cbor)
                         mari.send_attestation_to_cloud(node_id, asn_dl, asn_ul, evidence_cbor, attestation_binder)
-                        print(f"[ATTEST] → verifier: node=0x{node_id:016X}, asn_dl={asn_dl}, asn_ul={asn_ul}, offset={asn_ul - asn_dl}")
-                        print(f"[ATTEST]   evidence={len(evidence_cbor)} B, binder={len(attestation_binder)} B, total={attest_total} B")
-                    else:
-                        print(f"[ATTEST] WARNING: EAD4 present but value is empty for node 0x{node_id:016X}")
-                else:
-                    print(f"[ATTEST] WARNING: no EAD4 in msg4 from node 0x{node_id:016X}")
-            except Exception as e:
-                print(f"[EDHOC] ERROR: msg4 failed for node 0x{node_id:016X}: {e}")
+            except BaseException:
+                pass
 
 
 @click.command()
-@click.option(
-    "--port",
-    "-p",
-    type=str,
-    default=get_default_port(),
-    show_default=True,
-    help="Serial port to use (e.g., /dev/ttyACM0)",
-)
-@click.option(
-    "--mqtt-url",
-    "-m",
-    type=str,
-    default=None,
-    help="MQTT broker to use (default: None, no cloud)",
-)
-@click.option(
-    "--metrics-probe-interval",
-    "-i",
-    type=float,
-    default=0,
-    help="How often to send a metrics probe in seconds (default: 0, no metrics)",
-)
-@click.option(
-    "--log-dir",
-    default="logs",
-    show_default=True,
-    help="Directory to save metric log files.",
-    type=click.Path(),
-)
-def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir: str):
-    """MarilibEdge example with EDHOC key exchange (edge = Initiator)."""
+@click.option("--port", "-p", type=str, default=get_default_port(), show_default=True, help="Serial port (e.g. /dev/ttyACM0)")
+@click.option("--mqtt-url", "-m", type=str, default=None, help="MQTT broker URL (default: no cloud)")
+@click.option("--metrics-probe-interval", "-i", type=float, default=0, help="Metrics probe interval in seconds (0 = disabled)")
+@click.option("--log-dir", default="logs", show_default=True, help="Directory for metric log files", type=click.Path())
+@click.option("--eval-log", default="eval_edhoc.csv", show_default=True, help="CSV file (or prefix when --runs > 1)", type=click.Path())
+@click.option("--target-nodes", "-N", type=int, default=100, show_default=True, help="Number of nodes expected per run")
+@click.option("--runs", "-r", type=int, default=1, show_default=True, help="Number of repeated runs (uses reboot between rounds)")
+@click.option("--reboot-wait", type=float, default=5.0, show_default=True, help="Seconds to wait after reboot command before sending msg1")
+@click.option("--auto-exit", is_flag=True, default=False, show_default=True, help="Exit after all attestations complete (single-run mode only; always true when --runs > 1)")
+@click.option("--round-timeout", type=float, default=300.0, show_default=True, help="Seconds before a round is forced to end even if not all nodes attested (0 = no timeout)")
+@click.option("--warmup-runs", type=int, default=1, show_default=True, help="Warm-up rounds to run before recording (results discarded, default: 1)")
+def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log, target_nodes, runs, reboot_wait, auto_exit, round_timeout, warmup_runs):
+    """MarilibEdge: EDHOC + attestation initiator. Supports repeated runs via coordinated node reboot."""
 
+    # Shared mutable state — updated in-place between rounds so the closure always sees current values
     edhoc_state: dict = {
-        "initiator": None,
-        "prev_initiator": None,  # fallback for msg2 from previous msg1
-        "msg1": None,
-        "sessions": {},
-        "last_msg1_sent": 0.0,
-        "pending_msg3": {},  # node_id → (msg3_bytes, last_sent_ts, retry_count)
+        "initiator": None, "prev_initiator": None, "msg1": None,
+        "sessions": {}, "last_msg1_sent": 0.0, "pending_msg3": {},
     }
-
     node_state: dict = {
-        "joined":     set(),  # node_ids currently connected to the network
-        "edhoc_done": set(),  # node_ids that completed the full EDHOC handshake
+        "joined": set(), "edhoc_done": set(), "attest_done_nodes": set(),
+    }
+    eval_state: dict = {
+        "t0": None, "done": False, "writer": None,
+        "run": 0, "total_runs": runs,
+        "accepting_results": False,  # True only while a round is actively measuring
     }
 
     def on_event_wrapper(event: EdgeEvent, event_data):
-        on_event(event, event_data, mari, edhoc_state, node_state)
+        on_event(event, event_data, mari, edhoc_state, node_state, eval_state, target_nodes)
 
     mari = MarilibEdge(
         on_event_wrapper,
         serial_interface=SerialAdapter(port),
         mqtt_interface=MQTTAdapter.from_url(mqtt_url, is_edge=True) if mqtt_url else None,
-        logger=MetricsLogger(
-            log_dir_base=log_dir, rotation_interval_minutes=1440, log_interval_seconds=1.0
-        ),
+        logger=MetricsLogger(log_dir_base=log_dir, rotation_interval_minutes=1440, log_interval_seconds=1.0),
         tui=None,
         main_file=__file__,
         metrics_probe_period=metrics_probe_interval,
     )
 
-    # Generate EDHOC msg1 and send to gateway for beacon broadcast
-    initiator, msg1 = _init_edhoc(mari)
-    edhoc_state["initiator"] = initiator
-    edhoc_state["msg1"] = msg1
-    mari.send_edhoc(EDHOC_MSG1, None, msg1)
-    edhoc_state["last_msg1_sent"] = time.time()
-    print(f"[EDHOC] msg1 ({len(msg1)} B): {msg1.hex()}")
-
-    last_status_print = 0.0
+    exit_on_done = auto_exit or (runs > 1)
 
     try:
-        while True:
-            mari.update()
+        for run in range(1 - warmup_runs, runs + 1):
+            is_warmup = run <= 0
+            warmup_label = f"WARMUP {warmup_runs + run}/{warmup_runs}" if is_warmup else f"{run}/{runs}"
 
-            now = time.time()
+            if is_warmup:
+                import io as _io
+                eval_file = _io.StringIO()  # discard warmup output
+            else:
+                csv_path = _csv_path_for_run(eval_log, run, runs)
+                eval_file = open(csv_path, "w", newline="")
 
-            # Print a status summary every 5 seconds so progress is visible without flooding.
-            if now - last_status_print >= 5.0:
-                done = node_state["edhoc_done"]
-                print(f"[STATUS] {len(done)} EDHOC complete")
-                last_status_print = now
+            writer = csv.writer(eval_file)
+            writer.writerow(["type", "timestamp", "node_id", "result"])
 
-            # Retry msg3 for joined nodes that haven't completed EDHOC yet.
-            for node_id, (msg3, last_sent, retry_count) in list(edhoc_state["pending_msg3"].items()):
-                if node_id not in node_state["joined"]:
-                    edhoc_state["pending_msg3"].pop(node_id, None)
-                    continue
-                if retry_count >= MSG3_MAX_RETRIES:
-                    edhoc_state["pending_msg3"].pop(node_id, None)
-                    print(f"[EDHOC] msg3 retry limit reached for node 0x{node_id:016X}, giving up")
-                    continue
-                if now - last_sent >= MSG3_RETRY_INTERVAL:
-                    mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
-                    edhoc_state["pending_msg3"][node_id] = (msg3, now, retry_count + 1)
-                    print(f"[EDHOC] msg3 retry #{retry_count + 1}/{MSG3_MAX_RETRIES} → node 0x{node_id:016X}")
+            # Reset all per-round state in-place
+            edhoc_state.update({
+                "initiator": None, "prev_initiator": None, "msg1": None,
+                "sessions": {}, "last_msg1_sent": 0.0, "pending_msg3": {},
+            })
+            node_state.update({"joined": set(), "edhoc_done": set(), "attest_done_nodes": set()})
+            eval_state.update({"t0": None, "done": False, "writer": writer, "run": run, "accepting_results": False})
 
-            # Rotate msg1: fresh ephemeral key, gateway overwrites old bytes next beacon.
-            # Previous initiator is kept one cycle as fallback for late-arriving msg2.
-            # Do NOT clear sessions: nodes that already have msg3 in flight must still be
-            # able to complete with msg4.  Sessions are removed individually when msg4 arrives.
-            if now - edhoc_state["last_msg1_sent"] >= EDHOC_MSG1_RESEND_INTERVAL:
-                initiator, msg1 = _init_edhoc(mari)
-                edhoc_state["prev_initiator"] = edhoc_state["initiator"]
-                edhoc_state["initiator"] = initiator
-                edhoc_state["msg1"] = msg1
-                mari.send_edhoc(EDHOC_MSG1, None, msg1)
-                edhoc_state["last_msg1_sent"] = now
-                print(f"[EDHOC] msg1 rotated ({len(msg1)} B): {msg1.hex()}")
+            print(f"\n{'#'*62}")
+            if is_warmup:
+                print(f"# [EVAL] {warmup_label}  (warm-up — results not recorded)")
+            else:
+                print(f"# [EVAL] Run {warmup_label}  →  {csv_path}")
+            print(f"{'#'*62}\n")
 
-            time.sleep(0.001)
+            # Send new msg1 BEFORE rebooting so the gateway beacon carries the new
+            # msg1 the moment nodes come back.  If reboot is sent first, the stale msg1
+            # remains in the beacon during reboot_wait; rebooted nodes process it and
+            # their msg2 is rejected with "no matching session" in the next round.
+            initiator, msg1 = _init_edhoc(mari)
+            edhoc_state["initiator"] = initiator
+            edhoc_state["msg1"] = msg1
+
+            t0 = time.time()
+            edhoc_state["last_msg1_sent"] = t0
+            mari.send_edhoc(EDHOC_MSG1, None, msg1)
+            eval_state["t0"] = t0
+            eval_state["accepting_results"] = True
+            writer.writerow(["t0", f"{t0:.6f}", "", ""])
+            eval_file.flush()
+            t0_wall = datetime.fromtimestamp(t0).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[EVAL] T0 = {t0_wall}  msg1 broadcast ({len(msg1)} B)")
+
+            # Reboot all connected nodes — they rejoin with the new msg1 already in
+            # the beacon.  Round 1: harmless (no nodes connected yet).
+            mari.send_reboot_all()
+            if reboot_wait > 0:
+                print(f"[EVAL] Reboot sent — waiting {reboot_wait:.0f}s for nodes to restart...")
+                time.sleep(reboot_wait)
+            print(f"[EVAL] Reboot wait done — round {run} active  (target={target_nodes}, timeout={round_timeout:.0f}s)")
+
+            last_flush = 0.0
+
+            while not eval_state["done"]:
+                mari.update()
+                now = time.time()
+
+                if round_timeout > 0 and now - t0 >= round_timeout:
+                    attested = len(node_state["attest_done_nodes"])
+                    print(f"[EVAL] Round {run} TIMEOUT after {round_timeout:.0f}s — {attested}/{target_nodes} attested")
+                    writer.writerow(["timeout", f"{now:.6f}", "", f"{attested}/{target_nodes}"])
+                    eval_state["accepting_results"] = False
+                    eval_state["done"] = True
+                    break
+
+                if now - last_flush >= 2.0:
+                    eval_file.flush()
+                    last_flush = now
+
+                # Retry msg3 for nodes that haven't completed EDHOC yet
+                for node_id, (msg3, last_sent, retry_count) in list(edhoc_state["pending_msg3"].items()):
+                    if node_id not in node_state["joined"]:
+                        edhoc_state["pending_msg3"].pop(node_id, None)
+                        continue
+                    if retry_count >= MSG3_MAX_RETRIES:
+                        edhoc_state["pending_msg3"].pop(node_id, None)
+                        continue
+                    if now - last_sent >= MSG3_RETRY_INTERVAL:
+                        mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
+                        edhoc_state["pending_msg3"][node_id] = (msg3, now, retry_count + 1)
+
+                # Rotate msg1 periodically for forward secrecy
+                if now - edhoc_state["last_msg1_sent"] >= EDHOC_MSG1_RESEND_INTERVAL:
+                    initiator, msg1 = _init_edhoc(mari)
+                    edhoc_state["prev_initiator"] = edhoc_state["initiator"]
+                    edhoc_state["initiator"] = initiator
+                    edhoc_state["msg1"] = msg1
+                    mari.send_edhoc(EDHOC_MSG1, None, msg1)
+                    edhoc_state["last_msg1_sent"] = now
+
+                # In single-run mode without --auto-exit, loop forever (Ctrl+C to stop)
+                if not exit_on_done and eval_state["done"]:
+                    break
+
+                time.sleep(0.001)
+
+            eval_file.flush()
+            eval_file.close()
+
+            if run < runs:
+                label = "Warm-up" if is_warmup else f"Round {run}"
+                print(f"[EVAL] {label} complete — starting next round immediately.")
+
     except KeyboardInterrupt:
         pass
     finally:
         mari.close_tui()
         mari.logger.close()
+
+    if runs > 1:
+        stem, ext = os.path.splitext(eval_log)
+        print(f"\n[EVAL] All {runs} runs done. CSVs saved as {stem}_001{ext or '.csv'} … {stem}_{runs:03d}{ext or '.csv'}")
+        print(f"[EVAL] Plot with:  python plot_avg_cdf.py {os.path.dirname(eval_log) or '.'}/")
 
 
 if __name__ == "__main__":

@@ -73,6 +73,8 @@ class EdgeEvent(IntEnum):
     GATEWAY_INFO = 5
     EDHOC = 6
     KICK_NODE = 7
+    ATTEST_RESULT = 8
+    REBOOT_ALL = 9
     UNKNOWN = 255
 
     @classmethod

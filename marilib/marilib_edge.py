@@ -149,7 +149,7 @@ class MarilibEdge(MarilibBase):
 
         self.last_received_mqtt_data_ts = datetime.now()
 
-        # Handle kick command from cloud verifier
+        # Handle control commands from cloud verifier
         try:
             event_type = EdgeEvent(data[0])
         except ValueError:
@@ -159,6 +159,15 @@ class MarilibEdge(MarilibBase):
             if len(data) >= 9:
                 node_id = int.from_bytes(data[1:9], "little")
                 self._send_kick_to_gateway(node_id)
+            return
+
+        if event_type == EdgeEvent.ATTEST_RESULT:
+            if len(data) >= 10:
+                node_id = int.from_bytes(data[1:9], "little")
+                result  = bool(data[9])
+                if not result:
+                    self._send_kick_to_gateway(node_id)
+                self.cb_application(EdgeEvent.ATTEST_RESULT, (node_id, result))
             return
 
         try:
@@ -269,6 +278,10 @@ class MarilibEdge(MarilibBase):
             buf += node_id.to_bytes(8, "little")
         buf += edhoc_data
         self.serial_interface.send_data(buf)
+
+    def send_reboot_all(self):
+        """Broadcast a reboot command to all nodes via the gateway and clear the association table."""
+        self.serial_interface.send_data(bytes([EdgeEvent.REBOOT_ALL]))
 
     def send_attestation_to_cloud(self, node_id: int, asn_dl: int, asn_ul: int, evidence_cbor: bytes, attestation_binder: bytes):
         """Forwards attestation evidence extracted from EDHOC EAD4 to the cloud verifier via MQTT."""
