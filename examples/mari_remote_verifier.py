@@ -1,128 +1,244 @@
-import csv
-import time
-import queue
+"""
+Related-work Remote Verifier.
+
+Receives nonce announcements and attestation evidence from the edge via MQTT.
+Counterpart to examples/mari_edge.py (EDHOC Responder, node = Initiator design).
+
+Protocol:
+  - /maura/nonce        : edge -> verifier, CBOR {node_id, nonce} -- register fresh nonce
+  - /maura/evidence     : edge -> verifier, CBOR {node_id, evidence, binder} -- verify token
+  - /maura/attest_result: verifier -> edge, CBOR {node_id, result} -- send back result
+
+Verification:
+  1. Look up stored nonce for node_id.
+  2. Decode COSE_Sign1 token from evidence bytes.
+  3. Verify nonce in EAT payload matches stored nonce.
+  4. Reconstruct Sig_Structure with attestation_binder as external_aad.
+  5. Verify Ed25519 signature.
+"""
+
 import threading
-from datetime import datetime
+import time
+from typing import Optional
 
+import cbor2
 import click
-from marilib.mari_protocol import MARI_BROADCAST_ADDRESS, MARI_NET_ID_DEFAULT, DefaultPayload, Frame
-from marilib.marilib_cloud import MarilibCloud
-from marilib.model import EdgeEvent, GatewayInfo, MariNode
-from marilib.communication_adapter import MQTTAdapter
-from marilib.tui_cloud import MarilibTUICloud
-from marilib.logger import MetricsLogger
+import paho.mqtt.client as mqtt_client
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature
 
-from marilib.marilib_attest_verifier import mr_swarm_verification_result_edhoc
+# MQTT topics (must match examples/mari_edge.py)
+TOPIC_NONCE    = "/maura/nonce"
+TOPIC_EVIDENCE = "/maura/evidence"
+TOPIC_RESULT   = "/maura/attest_result"
 
-NORMAL_DATA_PAYLOAD = b"NORMAL_APP_DATA"
-mari_instance = None
+# Ed25519 public key — matches _public_key[] in mari/app/03app_node/attestation.c
+ATTESTATION_PUBLIC_KEY = bytes([
+    0xb2, 0x4f, 0x6d, 0x4e, 0x5f, 0x81, 0x47, 0xaf, 0x1d, 0x1c, 0xd8, 0xc2, 0x6e, 0x1a, 0x51, 0x0b,
+    0x7a, 0x0f, 0x7f, 0x0a, 0x7b, 0xcc, 0x60, 0x68, 0x89, 0x55, 0xd3, 0x27, 0xb9, 0x9c, 0x64, 0x75,
+])
 
-verification_queue = queue.Queue()
-verification_stats = {
-    'received': 0,
-    'processed': 0,
-    'succeeded': 0,
-    'failed': 0,
-    'ignored': 0
-}
+# Fixed expected firmware hash (matches _test_hash[] in mari/app/03app_node/attestation.c)
+EXPECTED_HASH = bytes([
+    0xDE, 0x6C, 0xD0, 0x5D, 0x50, 0x77, 0x86, 0x48,
+    0xBD, 0xB0, 0x7B, 0x4D, 0x1C, 0x6D, 0xB8, 0x1E,
+    0x0C, 0x2D, 0xF4, 0x53, 0x3A, 0x32, 0xE5, 0x15,
+    0xE5, 0x33, 0xA2, 0x6E, 0x21, 0x72, 0x87, 0x3B,
+])
 
-def is_attestation_request(payload):
-    """Check if payload is an EDHOC attestation request (0xE4 tag)."""
-    return len(payload) >= 1 and payload[0] == 0xE4
+# ========================= COSE_Sign1 decoder ================================
 
-def on_event(event: EdgeEvent, event_data: MariNode | Frame | GatewayInfo):
-    """An event handler for the application."""
-    global mari_instance, verification_stats
+def _decode_cose_sign1(token: bytes):
+    """
+    Decode a COSE_Sign1 token (tag 18 / 0xd2 0x84 header).
+    Returns (protected_header_bytes, unprotected, payload_bytes, signature_bytes).
+    """
+    decoded = cbor2.loads(token)
+    # cbor2 may decode as CBORTag(18, [...]) or directly as a list
+    if hasattr(decoded, "value"):
+        parts = decoded.value
+    else:
+        parts = decoded
+    if not isinstance(parts, (list, tuple)) or len(parts) != 4:
+        raise ValueError(f"Expected COSE_Sign1 array(4), got {type(parts)}")
+    protected_bstr, unprotected, payload_bstr, sig_bstr = parts
+    return bytes(protected_bstr), unprotected, bytes(payload_bstr), bytes(sig_bstr)
 
-    if event == EdgeEvent.NODE_DATA:
-        frame: Frame = event_data
-        h = frame.header
-        p = frame.payload
 
-        if not is_attestation_request(p):
-            verification_stats['ignored'] += 1
-            return
+def _build_sig_structure(protected: bytes, external_aad: bytes, payload: bytes) -> bytes:
+    """Build the Sig_Structure for Ed25519 verification."""
+    return cbor2.dumps(["Signature1", protected, external_aad, payload])
 
-        verification_stats['received'] += 1
-        verification_queue.put(frame)
-        print(f"[VERIFIER] Received from node=0x{h.source:016X}, payload={len(p)} B, queue_size={verification_queue.qsize()}")
+
+def verify_cose_sign1(token: bytes, binder: bytes) -> tuple[bool, Optional[bytes]]:
+    """
+    Verify a COSE_Sign1 token.
+
+    Returns (ok, nonce_from_payload) where nonce_from_payload is the nonce
+    extracted from the EAT claim map (used for freshness check).
+    """
+    try:
+        protected, _unprotected, payload_bstr, signature = _decode_cose_sign1(token)
+    except Exception as e:
+        print(f"[VERIFIER] COSE decode failed: {e}")
+        return False, None
+
+    # Build Sig_Structure with binder as external_aad
+    sig_structure = _build_sig_structure(protected, binder, payload_bstr)
+
+    # Verify Ed25519 signature
+    pub_key = Ed25519PublicKey.from_public_bytes(ATTESTATION_PUBLIC_KEY)
+    try:
+        pub_key.verify(signature, sig_structure)
+    except InvalidSignature:
+        print("[VERIFIER] Signature INVALID")
+        return False, None
+    except Exception as e:
+        print(f"[VERIFIER] Signature verification error: {e}")
+        return False, None
+
+    # Decode EAT payload and extract nonce (claim 10)
+    try:
+        eat = cbor2.loads(payload_bstr)
+        nonce_in_token = bytes(eat.get(10, b""))  # claim 10 = nonce
+    except Exception as e:
+        print(f"[VERIFIER] EAT decode failed: {e}")
+        return True, None  # signature valid but can't extract nonce
+
+    return True, nonce_in_token
+
+
+# ========================= Verifier state ====================================
+
+class MauraVerifier:
+    def __init__(self):
+        self._nonce_store: dict[int, bytes] = {}
+        self._lock = threading.Lock()
+        self.stats = {"received": 0, "succeeded": 0, "failed": 0}
+
+    def register_nonce(self, node_id: int, nonce: bytes) -> None:
+        with self._lock:
+            self._nonce_store[node_id] = nonce
+
+    def verify_evidence(self, node_id: int, evidence: bytes, binder: bytes) -> bool:
+        with self._lock:
+            expected_nonce = self._nonce_store.get(node_id)
+
+        if expected_nonce is None:
+            print(f"[VERIFIER] No nonce for 0x{node_id:016X} — rejecting")
+            self.stats["failed"] += 1
+            return False
+
+        self.stats["received"] += 1
+
+        ok, nonce_from_token = verify_cose_sign1(evidence, binder)
+        if not ok:
+            print(f"[VERIFIER] Signature verification FAILED for 0x{node_id:016X}")
+            self.stats["failed"] += 1
+            return False
+
+        # Freshness: nonce in token must match the one we announced
+        if nonce_from_token is not None and nonce_from_token != expected_nonce:
+            print(f"[VERIFIER] Nonce mismatch for 0x{node_id:016X}: "
+                  f"expected={expected_nonce.hex()} got={nonce_from_token.hex()}")
+            self.stats["failed"] += 1
+            return False
+
+        print(f"[VERIFIER] Attestation PASSED for 0x{node_id:016X}")
+        self.stats["succeeded"] += 1
+
+        # Consume nonce (one-time use)
+        with self._lock:
+            self._nonce_store.pop(node_id, None)
+
+        return True
+
+
+# ========================= MQTT glue =========================================
+
+def _parse_mqtt_url(url: str) -> tuple[str, int, bool]:
+    """Parse mqtt://host:port or mqtts://host:port -> (host, port, tls)."""
+    if url.startswith("mqtts://"):
+        rest, tls = url[len("mqtts://"):], True
+    else:
+        rest, tls = url[len("mqtt://"):], False
+    host, _, port_str = rest.partition(":")
+    port = int(port_str) if port_str else (8883 if tls else 1883)
+    return host, port, tls
+
 
 @click.command()
-@click.option("--mqtt-url", "-m", type=str, default="mqtt://localhost:1883", show_default=True, help="MQTT broker to use")
-@click.option("--network-id", "-n", type=lambda x: int(x, 16), default=MARI_NET_ID_DEFAULT, help=f"Network ID to use [default: 0x{MARI_NET_ID_DEFAULT:04X}]")
-@click.option("--send-periodic", "-s", type=float, default=0, show_default=True, help="Send periodic packet every N seconds (0 = disabled)")
-@click.option("--log-dir", default="logs", show_default=True, help="Directory to save metric log files.", type=click.Path())
-@click.option("--target-nodes", "-N", type=int, default=100, show_default=True, help="Target number of nodes for evaluation")
-def main(mqtt_url: str, network_id: int, send_periodic: float, log_dir: str, target_nodes: int):
-    """A basic example of using the MariLibCloud library."""
-    global mari_instance
+@click.option("--mqtt-url", "-m", type=str, default="mqtt://localhost:1883",
+              show_default=True, help="MQTT broker URL")
+def main(mqtt_url: str):
+    """Related-work Remote Verifier: nonce store + COSE_Sign1 verification."""
 
-    print(f"[VERIFIER] Starting verifier for network 0x{network_id:04X}, target={target_nodes} nodes")
+    verifier   = MauraVerifier()
+    host, port, tls = _parse_mqtt_url(mqtt_url)
 
-    mari_instance = MarilibCloud(
-        on_event,
-        mqtt_interface=MQTTAdapter.from_url(mqtt_url, is_edge=False),
-        logger=MetricsLogger(
-            log_dir_base=log_dir, rotation_interval_minutes=1440, log_interval_seconds=1.0
-        ),
-        tui=MarilibTUICloud(),
-        network_id=network_id,
-        main_file=__file__,
-    )
+    client = mqtt_client.Client()
 
-    def verification_worker():
-        """Worker thread that processes verification requests one by one."""
-        while True:
-            try:
-                frame = verification_queue.get(timeout=1.0)
-                node_id = frame.header.source
-                payload = frame.payload
-                print(f"[VERIFIER] Processing attestation from node=0x{node_id:016X}, payload={len(payload)} B")
-                try:
-                    result = mr_swarm_verification_result_edhoc(payload)
-                    verification_stats['processed'] += 1
-                    if result:
-                        verification_stats['succeeded'] += 1
-                    else:
-                        verification_stats['failed'] += 1
+    def on_connect(c, userdata, flags, rc):
+        if rc == 0:
+            print(f"[VERIFIER] Connected to MQTT broker {host}:{port}")
+            c.subscribe(TOPIC_NONCE)
+            c.subscribe(TOPIC_EVIDENCE)
+            print(f"[VERIFIER] Subscribed to {TOPIC_NONCE} and {TOPIC_EVIDENCE}")
+        else:
+            print(f"[VERIFIER] MQTT connect failed: rc={rc}")
 
-                    # Send result back to edge for logging and kick-on-fail
-                    if mari_instance.mqtt_interface is not None:
-                        mari_instance.send_attest_result(node_id, result)
+    def on_message(c, userdata, msg):
+        try:
+            payload = cbor2.loads(msg.payload)
+        except Exception as e:
+            print(f"[VERIFIER] CBOR decode failed on {msg.topic}: {e}")
+            return
 
-                    s = verification_stats
-                    print(f"[VERIFIER] Summary: {s['processed']} evaluated, {s['succeeded']} succeeded, {s['failed']} failed (of {s['received']} received)")
-                except Exception as e:
-                    print(f"ERROR processing node=0x{node_id:04X}: {e}")
-                    verification_stats['failed'] += 1
-                finally:
-                    verification_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"Worker error: {e}")
+        if msg.topic == TOPIC_NONCE:
+            node_id = payload.get("node_id")
+            nonce   = payload.get("nonce")
+            if node_id is not None and nonce is not None:
+                verifier.register_nonce(int(node_id), bytes(nonce))
 
-    worker_thread = threading.Thread(target=verification_worker, daemon=True)
-    worker_thread.start()
-    print("[VERIFIER] Worker thread started, waiting for attestation requests...")
+        elif msg.topic == TOPIC_EVIDENCE:
+            node_id  = payload.get("node_id")
+            evidence = payload.get("evidence")
+            binder   = payload.get("binder")
+            if node_id is None or evidence is None or binder is None:
+                print("[VERIFIER] Incomplete evidence payload")
+                return
+            node_id = int(node_id)
+            evidence = bytes(evidence)
+            binder   = bytes(binder)
+            result  = verifier.verify_evidence(node_id, evidence, binder)
+
+            # Publish result back to edge
+            result_msg = cbor2.dumps({"node_id": node_id, "result": result})
+            c.publish(TOPIC_RESULT, result_msg)
+
+            s = verifier.stats
+            print(f"[VERIFIER] Stats: rcv={s['received']} ok={s['succeeded']} fail={s['failed']}")
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    if tls:
+        client.tls_set()
+
+    client.connect(host, port, keepalive=60)
+    client.loop_start()
+
+    print("[VERIFIER] Started. Waiting for attestations ...")
 
     try:
         while True:
-            mari_instance.update()
-            mari_instance.render_tui()
-            time.sleep(0.01)
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        s = verification_stats
-        print(f"\n[VERIFIER] Shutting down. Final stats:")
-        print(f"  - Attestation requests received : {s['received']}")
-        print(f"  - Evaluated                     : {s['processed']}")
-        print(f"  - Succeeded                     : {s['succeeded']}")
-        print(f"  - Failed                        : {s['failed']}")
-        print(f"  - Non-attestation ignored       : {s['ignored']}")
-        print(f"  - Queue remaining               : {verification_queue.qsize()}")
+        s = verifier.stats
+        print(f"\n[VERIFIER] Shutdown. received={s['received']} ok={s['succeeded']} fail={s['failed']}")
     finally:
-        mari_instance.close_tui()
-        mari_instance.logger.close()
+        client.loop_stop()
+        client.disconnect()
 
 
 if __name__ == "__main__":

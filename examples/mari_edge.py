@@ -1,4 +1,29 @@
+"""
+Related-work Edge — EDHOC Responder + Attestation relay.
+
+Design difference from the swarm mari_edge.py (this file on the
+measurement-edhoc-attestation branch):
+  - Node = EDHOC Initiator (sends msg1 in join request, msg3 with EAD_3 in uplink)
+  - Edge = EDHOC Responder (receives msg1, sends msg2 with EAD_2 in join response)
+
+EDHOC + Attestation flow:
+  1. MSG1 received (from join request):
+     - Generate 8-byte nonce, announce to verifier via MQTT.
+     - Build EAD_2 = CBOR [258, h'nonce'].
+     - process_message_1() -> prepare_message_2(ead_2) -> send MSG2 to node.
+  2. MSG3 received (from uplink):
+     - parse_message_3() -> verify_message_3().
+     - Extract EAD_3 (COSE_Sign1 token).
+     - Compute attestation_binder from msg1 + msg2.
+     - Send evidence + binder to verifier via MQTT.
+  3. attest_result received (from verifier, via MQTT):
+     - Log the result; kick the node from the gateway schedule if it failed
+       (mirrors the swarm implementation's "kick node if result is false").
+"""
+
 import csv
+import hashlib
+import hmac
 import os
 import time
 from datetime import datetime
@@ -6,32 +31,52 @@ from datetime import datetime
 import cbor2
 import click
 import lakers
-from lakers import EdhocInitiator, CredentialTransfer
+from lakers import EdhocResponder, CredentialTransfer
 
 from marilib.logger import MetricsLogger
-from marilib.mari_protocol import Frame, MARI_BROADCAST_ADDRESS, DefaultPayload
 from marilib.model import EdgeEvent, MariNode
 from marilib.communication_adapter import SerialAdapter, MQTTAdapter
 from marilib.serial_uart import get_default_port
-from marilib.tui_edge import MarilibTUIEdge
 from marilib.marilib_edge import MarilibEdge
 
 # EDHOC subtype constants (mirror of mr_edhoc_subtype_t in models.h)
 EDHOC_MSG1 = 1
 EDHOC_MSG2 = 2
 EDHOC_MSG3 = 3
-EDHOC_MSG4 = 4
 
-MSG3_RETRY_INTERVAL = 2.0   # seconds between msg3 retries (must be < node's MSG3_TIMEOUT_SLOTS ≈ 6s)
-MSG3_MAX_RETRIES    = 30    # max msg3 retry attempts per node
+# Must stay below the node's MSG2_TIMEOUT_SLOTS (~6s, see app/03app_node/main.c)
+# or every node reset lands the next retry on a stale session (same failure mode
+# already found and fixed on the swarm branch).
+MSG3_RETRY_INTERVAL = 2.0
+MSG3_MAX_RETRIES    = 30
 
-# Initiator (edge) static private DH key (matches I[0] in 03app_dotbot.c)
-I = bytes([
-    0x1f, 0x7e, 0x4a, 0xe4, 0x29, 0x3a, 0x34, 0x8b, 0xf2, 0xb1, 0x36, 0x5c, 0xe0, 0x98, 0xaa, 0x49,
-    0xc2, 0x07, 0xbd, 0x1b, 0xa7, 0xdd, 0xde, 0xcd, 0xfa, 0xd6, 0x0c, 0xad, 0xe8, 0x2e, 0x9e, 0xf5,
+# Downlink tag for the msg3 ack, sent the instant msg3 verifies successfully so the
+# node can stop retransmitting instead of guessing. Must match MAURA_MSG3_ACK_TAG in
+# app/03app_node/main.c.
+MSG3_ACK_TAG = 0xAC
+
+# MQTT topics for nonce announcement, evidence forwarding, and result retrieval
+MQTT_TOPIC_NONCE_ANNOUNCE = "/maura/nonce"
+MQTT_TOPIC_EVIDENCE       = "/maura/evidence"
+MQTT_TOPIC_ATTEST_RESULT  = "/maura/attest_result"
+
+# Edge = EDHOC Responder.
+# Uses the credentials previously held by the mari node (roles reversed).
+R = bytes([
+    0x72, 0xcc, 0x47, 0x61, 0xdb, 0xd4, 0xc7, 0x8f, 0x75, 0x89, 0x31, 0xaa, 0x58, 0x9d, 0x34, 0x8d,
+    0x1e, 0xf8, 0x74, 0xa7, 0xe3, 0x03, 0xed, 0xe2, 0xf1, 0x40, 0xdc, 0xf3, 0xe6, 0xaa, 0x4a, 0xac,
 ])
 
-# Initiator credential (matches CRED_I_BYTES in node main.c and CRED_I[0] in 03app_dotbot.c)
+CRED_R = bytes([
+    0xa2, 0x02, 0x6b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x65, 0x64, 0x75, 0x08, 0xa1,
+    0x01, 0xa5, 0x01, 0x02, 0x02, 0x41, 0x32, 0x20, 0x01, 0x21, 0x58, 0x20, 0xbb, 0xc3, 0x49, 0x60,
+    0x52, 0x6e, 0xa4, 0xd3, 0x2e, 0x94, 0x0c, 0xad, 0x2a, 0x23, 0x41, 0x48, 0xdd, 0xc2, 0x17, 0x91,
+    0xa1, 0x2a, 0xfb, 0xcb, 0xac, 0x93, 0x62, 0x20, 0x46, 0xdd, 0x44, 0xf0, 0x22, 0x58, 0x20, 0x45,
+    0x19, 0xe2, 0x57, 0x23, 0x6b, 0x2a, 0x0c, 0xe2, 0x02, 0x3f, 0x09, 0x31, 0xf1, 0xf3, 0x86, 0xca,
+    0x7a, 0xfd, 0xa6, 0x4f, 0xcd, 0xe0, 0x10, 0x8c, 0x22, 0x4c, 0x51, 0xea, 0xbf, 0x60, 0x72,
+])
+
+# CRED_I = expected node/initiator credential
 CRED_I = bytes([
     0xa2, 0x02, 0x78, 0x20, 0x38, 0x35, 0x43, 0x31, 0x45, 0x43, 0x32, 0x31, 0x46, 0x32, 0x36, 0x46,
     0x34, 0x31, 0x45, 0x37, 0x41, 0x33, 0x30, 0x41, 0x38, 0x41, 0x38, 0x37, 0x42, 0x44, 0x42, 0x45,
@@ -43,34 +88,35 @@ CRED_I = bytes([
     0xda, 0xc4, 0x19, 0x53, 0x2c,
 ])
 
-# Responder credential (matches CRED_R_BYTES in node main.c and CRED_R in 03app_dotbot.c)
-CRED_R = bytes([
-    0xa2, 0x02, 0x6b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x65, 0x64, 0x75, 0x08, 0xa1,
-    0x01, 0xa5, 0x01, 0x02, 0x02, 0x41, 0x32, 0x20, 0x01, 0x21, 0x58, 0x20, 0xbb, 0xc3, 0x49, 0x60,
-    0x52, 0x6e, 0xa4, 0xd3, 0x2e, 0x94, 0x0c, 0xad, 0x2a, 0x23, 0x41, 0x48, 0xdd, 0xc2, 0x17, 0x91,
-    0xa1, 0x2a, 0xfb, 0xcb, 0xac, 0x93, 0x62, 0x20, 0x46, 0xdd, 0x44, 0xf0, 0x22, 0x58, 0x20, 0x45,
-    0x19, 0xe2, 0x57, 0x23, 0x6b, 0x2a, 0x0c, 0xe2, 0x02, 0x3f, 0x09, 0x31, 0xf1, 0xf3, 0x86, 0xca,
-    0x7a, 0xfd, 0xa6, 0x4f, 0xcd, 0xe0, 0x10, 0x8c, 0x22, 0x4c, 0x51, 0xea, 0xbf, 0x60, 0x72,
-])
-
-# How often to rotate msg1 (new ephemeral key for forward secrecy).
-EDHOC_MSG1_RESEND_INTERVAL = 300.0
+# ID_CRED_I = {4: h'\x01'} as CBOR bytes — matches _id_cred_i_cbor in app/03app_node/attestation.c
+ID_CRED_I_BYTES = bytes([0xa1, 0x04, 0x41, 0x01])
 
 
-def _init_edhoc(mari: MarilibEdge) -> tuple[EdhocInitiator, bytes]:
-    """Create a fresh EdhocInitiator and generate message 1 (no EAD_1)."""
-    initiator = EdhocInitiator()
-    msg1 = initiator.prepare_message_1(c_i=None, ead_1=None)
-    return initiator, msg1
+# ========================= Attestation binder =================================
+
+def _compute_h12(msg1: bytes, msg2: bytes) -> bytes:
+    """H_12 = SHA256(SHA256(msg1) || msg2)."""
+    h_msg1 = hashlib.sha256(msg1).digest()
+    return hashlib.sha256(h_msg1 + msg2).digest()
 
 
-def _csv_path_for_run(eval_log: str, run: int, runs: int) -> str:
-    """Return the CSV path for a given run number (numbered only when runs > 1)."""
-    if runs == 1:
-        return eval_log
-    stem, ext = os.path.splitext(eval_log)
-    return f"{stem}_{run:03d}{ext or '.csv'}"
+def _hkdf_expand_sha256(prk: bytes, info: bytes) -> bytes:
+    """HKDF-Expand(prk, info, 32): T(1) = HMAC-SHA256(prk, info || 0x01)."""
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
 
+
+def compute_attestation_binder(msg1: bytes, msg2: bytes) -> bytes:
+    """
+    attestation_binder = HKDF-Expand(zero_32, CBOR[H_12, "attestation", {4: h'\x01'}], 32)
+    Mirrors _compute_attestation_binder() in app/03app_node/attestation.c.
+    """
+    h12         = _compute_h12(msg1, msg2)
+    attest_info = cbor2.dumps([h12, "attestation", {4: bytes([0x01])}])
+    zero_key    = bytes(32)
+    return _hkdf_expand_sha256(zero_key, attest_info)
+
+
+# ========================= Event handler =====================================
 
 def on_event(
     event: EdgeEvent,
@@ -81,7 +127,6 @@ def on_event(
     eval_state: dict,
     target_nodes: int,
 ):
-    """Application event handler — eval_state['writer'] holds the current CSV writer."""
     writer = eval_state["writer"]
 
     if event == EdgeEvent.NODE_JOINED:
@@ -90,103 +135,241 @@ def on_event(
 
     elif event == EdgeEvent.NODE_LEFT:
         node_state["joined"].discard(event_data.address)
-        edhoc_state["pending_msg3"].pop(event_data.address, None)
-
-    elif event == EdgeEvent.ATTEST_RESULT:
-        if not eval_state["accepting_results"]:
-            return  # round not active — discard late results from verifier backlog
-        node_id, result = event_data
-        if node_id in node_state["attest_done_nodes"]:
-            return  # duplicate result for this node, ignore
-        node_state["attest_done_nodes"].add(node_id)
-        ts = time.time()
-        elapsed = ts - eval_state["t0"] if eval_state["t0"] else 0.0
-        writer.writerow(["attest_result", f"{ts:.6f}", f"0x{node_id:016X}", str(result)])
-        count = len(node_state["attest_done_nodes"])
-        run_label = f"run {eval_state['run']}/{eval_state['total_runs']}  " if eval_state["total_runs"] > 1 else ""
-        print(f"[EVAL] {run_label}Attest node=0x{node_id:016X} result={result} at +{elapsed:.1f}s  ({count}/{target_nodes})")
-        if count == target_nodes:
-            print(f"[EVAL] *** ALL {target_nodes} ATTESTATIONS DONE in {elapsed:.1f}s ***")
-            eval_state["accepting_results"] = False
-            eval_state["done"] = True
-
-    elif event == EdgeEvent.NODE_DATA:
-        pass
+        edhoc_state["sessions"].pop(event_data.address, None)
+        edhoc_state["pending_msg2"].pop(event_data.address, None)
+        edhoc_state["completed"].discard(event_data.address)
 
     elif event == EdgeEvent.EDHOC:
-        subtype, node_id, edhoc_bytes, asn_dl, asn_ul = event_data
+        subtype, node_id, edhoc_bytes, _asn_dl, _asn_ul = event_data
 
-        if subtype == EDHOC_MSG2:
-            if not (10 <= len(edhoc_bytes) <= 200):
-                return  # obviously corrupted length — drop before lakers sees it
-            session = None
-            for src_initiator in [edhoc_state["initiator"], edhoc_state["prev_initiator"]]:
-                if src_initiator is None:
-                    continue
-                try:
-                    candidate = src_initiator.clone_after_message_1()
-                    _c_r, id_cred_r, _ead_2 = candidate.parse_message_2(edhoc_bytes)
-                    valid_cred_r = lakers.credential_check_or_fetch(id_cred_r, CRED_R)
-                    candidate.verify_message_2(I, CRED_I, valid_cred_r)
-                    session = candidate
-                    break
-                except BaseException:
-                    # Rust panic on corrupted packet — the clone panicked, not the
-                    # original initiator, so src_initiator is still valid. Just skip
-                    # this corrupted msg2 and let the thread continue normally.
-                    break
+        if subtype == EDHOC_MSG1:
+            # Node sent msg1 in join request -> create responder session
 
-            if session is None:
+            # The node caches msg1 once and the mari MAC layer resends the identical
+            # join request (byte-for-byte) on its own backoff schedule until a join
+            # response actually arrives -- so a repeat arrival with the SAME bytes is
+            # just a retransmit, not a new session, and we should resend the cached
+            # msg2 rather than reset (multi-node contention can otherwise make retries
+            # arrive faster than a msg2 round-trip completes, so the session keeps
+            # getting reset and never converges to msg3).
+            #
+            # But if the node rebooted (e.g. it gave up waiting for msg2 and retried
+            # from scratch -- see MSG2_TIMEOUT_SLOTS in app/03app_node/main.c), it
+            # generates a genuinely new msg1 with a fresh ephemeral key: different
+            # bytes, same node_id. Treating that as a stale retry too (matching only
+            # on node_id) means resending an old msg2 the node's new session can never
+            # verify -- it just reboots again ~6s later, forever, and nothing ever
+            # reaches msg3. So only short-circuit when the bytes actually match.
+            existing = edhoc_state["sessions"].get(node_id)
+            if existing is not None and existing["msg1"] == edhoc_bytes:
+                mari.send_edhoc(EDHOC_MSG2, node_id, existing["msg2"])
+                _, _, retry_count = edhoc_state["pending_msg2"].get(node_id, (None, None, 0))
+                edhoc_state["pending_msg2"][node_id] = (existing["msg2"], time.time(), retry_count)
+                return
+
+            if not (5 <= len(edhoc_bytes) <= 200):
                 return
 
             try:
-                msg3, _prk_out = session.prepare_message_3(CredentialTransfer.ByReference, None)
-            except BaseException:
+                responder = EdhocResponder(R, CRED_R)
+                _c_i, ead_1 = responder.process_message_1(edhoc_bytes)
+            except Exception as e:
+                print(f"[MAURA] process_message_1 failed for 0x{node_id:016X}: {e}")
                 return
 
-            edhoc_state["sessions"][node_id] = session
-            edhoc_state["pending_msg3"][node_id] = (msg3, time.time(), 0)
-            mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
+            # Generate nonce and announce to verifier
+            nonce = os.urandom(8)
+            _announce_nonce(mari, node_id, nonce)
 
-        elif subtype == EDHOC_MSG4:
-            edhoc_state["pending_msg3"].pop(node_id, None)
+            # Build EAD_2 = CBOR [258, h'nonce']
+            ead_2_value = cbor2.dumps([258, nonce])
+            ead_2       = lakers.EADItem(2, False, ead_2_value)
+
+            # Deterministic connection ID from node_id, restricted to 0..23: the node's
+            # C API (lakers-c) strips the CBOR type header off the parsed c_r and later
+            # rebuilds it via ConnId::from_int_raw(), which only accepts raw bytes that
+            # are already a valid compact CBOR positive int (0..23) -- anything outside
+            # that range reconstructs into an invalid ConnId and panics the node the
+            # first time something classifies it (shared/src/lib.rs's
+            # "Type invariant requires valid classification" unreachable!()).
+            c_r = node_id % 24
+            try:
+                msg2 = responder.prepare_message_2(CredentialTransfer.ByReference, [c_r], ead_2)
+            except Exception as e:
+                print(f"[MAURA] prepare_message_2 failed for 0x{node_id:016X}: {e}")
+                return
+
+            edhoc_state["sessions"][node_id] = {
+                "responder": responder,
+                "msg1":      edhoc_bytes,
+                "msg2":      bytes(msg2),
+                "nonce":     nonce,
+            }
+            edhoc_state["pending_msg2"][node_id] = (bytes(msg2), time.time(), 0)
+            mari.send_edhoc(EDHOC_MSG2, node_id, msg2)
+
+        elif subtype == EDHOC_MSG3:
+            # Node sent msg3 with EAD_3 in uplink
+            edhoc_state["pending_msg2"].pop(node_id, None)
+
+            if node_id in edhoc_state["completed"]:
+                # We already verified msg3 for this node and popped its session --
+                # this arrival is the node retransmitting because our ack got lost,
+                # not a new msg3. Just re-send the ack; do NOT re-verify or re-submit
+                # evidence to the verifier (the nonce is already consumed there, so a
+                # second submission would fail nonce-reuse and could wrongly get the
+                # node kicked for what was actually a successful attestation).
+                mari.send_frame(node_id, bytes([MSG3_ACK_TAG]))
+                return
+
             session = edhoc_state["sessions"].pop(node_id, None)
             if session is None:
                 return
-            try:
-                ead_4 = session.process_message_4(edhoc_bytes)
-                attestation_binder = session.edhoc_exporter(2, b'attestation', 32)
-                node_state["edhoc_done"].add(node_id)
 
-                if ead_4 is not None:
-                    evidence_cbor = ead_4.value()
-                    if evidence_cbor is not None:
-                        attest_cbor = cbor2.dumps([asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder])
-                        attest_total = 1 + len(attest_cbor)
-                        mari.send_attestation_to_cloud(node_id, asn_dl, asn_ul, evidence_cbor, attestation_binder)
-            except BaseException:
-                pass
+            responder = session["responder"]
+            msg1      = session["msg1"]
+            msg2      = session["msg2"]
+
+            try:
+                id_cred_i, ead_3 = responder.parse_message_3(edhoc_bytes)
+                valid_cred_i      = lakers.credential_check_or_fetch(id_cred_i, CRED_I)
+                _prk_out          = responder.verify_message_3(valid_cred_i)
+            except Exception as e:
+                print(f"[MAURA] parse/verify_message_3 failed for 0x{node_id:016X}: {e}")
+                return
+
+            node_state["edhoc_done"].add(node_id)
+            edhoc_state["completed"].add(node_id)
+            mari.send_frame(node_id, bytes([MSG3_ACK_TAG]))
+            print(f"[MAURA] EDHOC complete for 0x{node_id:016X}")
+
+            if ead_3 is not None:
+                evidence = ead_3.value()
+                if evidence:
+                    binder = compute_attestation_binder(msg1, msg2)
+                    _send_evidence_to_verifier(mari, node_id, evidence, binder)
+
+    elif event == EdgeEvent.ATTEST_RESULT:
+        # Synthesized locally by _wire_attest_result_subscription() below — the swarm
+        # branch's ATTEST_RESULT travels over the uniform /mari/{network_id}/to_edge
+        # channel; this design uses its own /maura/attest_result topic instead, but
+        # reuses the same EdgeEvent value and (node_id, result) tuple shape.
+        if not eval_state["accepting_results"]:
+            return  # round not active -- discard late results from verifier backlog
+        node_id, result = event_data
+        if node_id in node_state["attest_done_nodes"]:
+            return  # duplicate result, ignore
+        node_state["attest_done_nodes"].add(node_id)
+
+        if not result:
+            mari._send_kick_to_gateway(node_id)
+            print(f"[MAURA] Attestation FAILED for 0x{node_id:016X} -> kicked from gateway")
+
+        ts      = time.time()
+        elapsed = ts - eval_state["t0"] if eval_state["t0"] else 0.0
+        writer.writerow(["attest_result", f"{ts:.6f}", f"0x{node_id:016X}", str(result)])
+        count = len(node_state["attest_done_nodes"])
+        print(f"[EVAL] Attest node=0x{node_id:016X} result={result} at +{elapsed:.1f}s ({count}/{target_nodes})")
+        if count == target_nodes:
+            print(f"[EVAL] *** ALL {target_nodes} ATTESTATIONS DONE in {elapsed:.1f}s ***")
+            eval_state["accepting_results"] = False
+            eval_state["done"]              = True
+
+
+def _announce_nonce(mari: MarilibEdge, node_id: int, nonce: bytes) -> None:
+    """Send nonce announcement to verifier via MQTT so it can store node_id->nonce."""
+    if not mari.uses_mqtt:
+        return
+    payload = cbor2.dumps({"node_id": node_id, "nonce": nonce})
+    try:
+        mari.mqtt_interface.client.publish(MQTT_TOPIC_NONCE_ANNOUNCE, payload)
+    except Exception as e:
+        print(f"[MAURA] MQTT nonce announce failed: {e}")
+
+
+def _send_evidence_to_verifier(mari: MarilibEdge, node_id: int, evidence: bytes, binder: bytes) -> None:
+    """Send COSE_Sign1 evidence and attestation_binder to verifier via MQTT."""
+    if not mari.uses_mqtt:
+        return
+    payload = cbor2.dumps({"node_id": node_id, "evidence": evidence, "binder": binder})
+    try:
+        mari.mqtt_interface.client.publish(MQTT_TOPIC_EVIDENCE, payload)
+    except Exception as e:
+        print(f"[MAURA] MQTT evidence send failed: {e}")
+
+
+def _wire_attest_result_subscription(mari: MarilibEdge, on_event_wrapper) -> None:
+    """
+    Subscribe to /maura/attest_result on the edge's existing MQTT client.
+
+    MQTTAdapter binds client.on_message to its own handler for the uniform
+    /mari/{network_id}/to_edge channel; message_callback_add() attaches a
+    topic-specific callback that paho dispatches instead of on_message for
+    this one topic, without disturbing the rest of the edge<->cloud traffic.
+
+    The subscribe call itself only registers with the *current* broker session.
+    MQTTAdapter's own on_connect (_on_connect_edge) re-subscribes its uniform
+    /mari/.../to_edge topic on every reconnect, but had no idea about this
+    extra topic -- so a single MQTT reconnect (broker blip, keepalive timeout
+    under load, etc.) silently unsubscribed us from /maura/attest_result
+    forever, since this function only ever ran once. Chaining onto on_connect
+    makes the subscription self-healing across reconnects, same as the
+    library's own topic.
+    """
+    client = mari.mqtt_interface.client
+
+    def _on_attest_result(_client, _userdata, message):
+        try:
+            payload = cbor2.loads(message.payload)
+            node_id = int(payload["node_id"])
+            result  = bool(payload["result"])
+        except Exception as e:
+            print(f"[MAURA] Malformed attest_result payload: {e}")
+            return
+        on_event_wrapper(EdgeEvent.ATTEST_RESULT, (node_id, result))
+
+    def _subscribe():
+        client.message_callback_add(MQTT_TOPIC_ATTEST_RESULT, _on_attest_result)
+        client.subscribe(MQTT_TOPIC_ATTEST_RESULT, qos=0)
+
+    _prior_on_connect = client.on_connect
+
+    def _on_connect_chained(c, userdata, flags, reason_code, properties):
+        if _prior_on_connect:
+            _prior_on_connect(c, userdata, flags, reason_code, properties)
+        _subscribe()
+
+    client.on_connect = _on_connect_chained
+    _subscribe()
+
+
+def _csv_path_for_run(eval_log: str, run: int, runs: int) -> str:
+    if runs == 1:
+        return eval_log
+    stem, ext = os.path.splitext(eval_log)
+    return f"{stem}_{run:03d}{ext or '.csv'}"
 
 
 @click.command()
-@click.option("--port", "-p", type=str, default=get_default_port(), show_default=True, help="Serial port (e.g. /dev/ttyACM0)")
-@click.option("--mqtt-url", "-m", type=str, default=None, help="MQTT broker URL (default: no cloud)")
-@click.option("--metrics-probe-interval", "-i", type=float, default=0, help="Metrics probe interval in seconds (0 = disabled)")
-@click.option("--log-dir", default="logs", show_default=True, help="Directory for metric log files", type=click.Path())
-@click.option("--eval-log", default="eval_edhoc.csv", show_default=True, help="CSV file (or prefix when --runs > 1)", type=click.Path())
-@click.option("--target-nodes", "-N", type=int, default=100, show_default=True, help="Number of nodes expected per run")
-@click.option("--runs", "-r", type=int, default=1, show_default=True, help="Number of repeated runs (uses reboot between rounds)")
-@click.option("--reboot-wait", type=float, default=5.0, show_default=True, help="Seconds to wait after reboot command before sending msg1")
-@click.option("--auto-exit", is_flag=True, default=False, show_default=True, help="Exit after all attestations complete (single-run mode only; always true when --runs > 1)")
-@click.option("--round-timeout", type=float, default=300.0, show_default=True, help="Seconds before a round is forced to end even if not all nodes attested (0 = no timeout)")
-@click.option("--warmup-runs", type=int, default=1, show_default=True, help="Warm-up rounds to run before recording (results discarded, default: 1)")
-def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log, target_nodes, runs, reboot_wait, auto_exit, round_timeout, warmup_runs):
-    """MarilibEdge: EDHOC + attestation initiator. Supports repeated runs via coordinated node reboot."""
+@click.option("--port", "-p", type=str, default=get_default_port(), show_default=True)
+@click.option("--mqtt-url", "-m", type=str, default=None)
+@click.option("--metrics-probe-interval", "-i", type=float, default=0)
+@click.option("--log-dir", default="logs", show_default=True, type=click.Path())
+@click.option("--eval-log", default="eval_maura.csv", show_default=True, type=click.Path())
+@click.option("--target-nodes", "-N", type=int, default=100, show_default=True)
+@click.option("--runs", "-r", type=int, default=1, show_default=True)
+@click.option("--reboot-wait", type=float, default=5.0, show_default=True)
+@click.option("--auto-exit", is_flag=True, default=False)
+@click.option("--round-timeout", type=float, default=300.0, show_default=True)
+@click.option("--warmup-runs", type=int, default=1, show_default=True)
+def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log,
+         target_nodes, runs, reboot_wait, auto_exit, round_timeout, warmup_runs):
+    """Related-work Edge: EDHOC Responder + attestation relay (node = Initiator)."""
 
-    # Shared mutable state — updated in-place between rounds so the closure always sees current values
     edhoc_state: dict = {
-        "initiator": None, "prev_initiator": None, "msg1": None,
-        "sessions": {}, "last_msg1_sent": 0.0, "pending_msg3": {},
+        "sessions":    {},
+        "pending_msg2": {},
+        "completed":   set(),
     }
     node_state: dict = {
         "joined": set(), "edhoc_done": set(), "attest_done_nodes": set(),
@@ -194,23 +377,37 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log, target_nodes
     eval_state: dict = {
         "t0": None, "done": False, "writer": None,
         "run": 0, "total_runs": runs,
-        "accepting_results": False,  # True only while a round is actively measuring
+        "accepting_results": False,
     }
 
-    def on_event_wrapper(event: EdgeEvent, event_data):
+    def on_event_wrapper(event, event_data):
         on_event(event, event_data, mari, edhoc_state, node_state, eval_state, target_nodes)
 
     mari = MarilibEdge(
         on_event_wrapper,
         serial_interface=SerialAdapter(port),
         mqtt_interface=MQTTAdapter.from_url(mqtt_url, is_edge=True) if mqtt_url else None,
-        logger=MetricsLogger(log_dir_base=log_dir, rotation_interval_minutes=1440, log_interval_seconds=1.0),
+        logger=MetricsLogger(log_dir_base=log_dir, rotation_interval_minutes=1440,
+                             log_interval_seconds=1.0),
         tui=None,
         main_file=__file__,
         metrics_probe_period=metrics_probe_interval,
     )
 
     exit_on_done = auto_exit or (runs > 1)
+    result_subscription_wired = False
+
+    # Wire the attest_result subscription before the first round's reboot_wait sleep below.
+    # Otherwise nodes that finish EDHOC + attestation during that blocking sleep (before the
+    # per-round loop -- where this used to be wired -- ever runs) get their result published
+    # by the verifier while mari_edge isn't subscribed yet, and MQTT doesn't back-deliver
+    # messages published before a subscription existed, so the result is silently lost.
+    if mari.uses_mqtt:
+        while not mari.mqtt_connected:
+            mari.update()
+            time.sleep(0.01)
+        _wire_attest_result_subscription(mari, on_event_wrapper)
+        result_subscription_wired = True
 
     try:
         for run in range(1 - warmup_runs, runs + 1):
@@ -219,95 +416,77 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log, target_nodes
 
             if is_warmup:
                 import io as _io
-                eval_file = _io.StringIO()  # discard warmup output
+                eval_file = _io.StringIO()
             else:
                 csv_path = _csv_path_for_run(eval_log, run, runs)
+                csv_dir  = os.path.dirname(csv_path)
+                if csv_dir:
+                    os.makedirs(csv_dir, exist_ok=True)
                 eval_file = open(csv_path, "w", newline="")
 
             writer = csv.writer(eval_file)
             writer.writerow(["type", "timestamp", "node_id", "result"])
 
-            # Reset all per-round state in-place
-            edhoc_state.update({
-                "initiator": None, "prev_initiator": None, "msg1": None,
-                "sessions": {}, "last_msg1_sent": 0.0, "pending_msg3": {},
-            })
+            edhoc_state.update({"sessions": {}, "pending_msg2": {}, "completed": set()})
             node_state.update({"joined": set(), "edhoc_done": set(), "attest_done_nodes": set()})
-            eval_state.update({"t0": None, "done": False, "writer": writer, "run": run, "accepting_results": False})
+            eval_state.update({"t0": None, "done": False, "writer": writer, "run": run,
+                                "accepting_results": False})
 
             print(f"\n{'#'*62}")
             if is_warmup:
-                print(f"# [EVAL] {warmup_label}  (warm-up — results not recorded)")
+                print(f"# [EVAL] {warmup_label}  (warm-up)")
             else:
-                print(f"# [EVAL] Run {warmup_label}  →  {csv_path}")
+                print(f"# [EVAL] Run {warmup_label}  ->  {csv_path}")
             print(f"{'#'*62}\n")
 
-            # Send new msg1 BEFORE rebooting so the gateway beacon carries the new
-            # msg1 the moment nodes come back.  If reboot is sent first, the stale msg1
-            # remains in the beacon during reboot_wait; rebooted nodes process it and
-            # their msg2 is rejected with "no matching session" in the next round.
-            initiator, msg1 = _init_edhoc(mari)
-            edhoc_state["initiator"] = initiator
-            edhoc_state["msg1"] = msg1
-
             t0 = time.time()
-            edhoc_state["last_msg1_sent"] = t0
-            mari.send_edhoc(EDHOC_MSG1, None, msg1)
-            eval_state["t0"] = t0
+            eval_state["t0"]               = t0
             eval_state["accepting_results"] = True
             writer.writerow(["t0", f"{t0:.6f}", "", ""])
             eval_file.flush()
             t0_wall = datetime.fromtimestamp(t0).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            print(f"[EVAL] T0 = {t0_wall}  msg1 broadcast ({len(msg1)} B)")
+            print(f"[EVAL] T0 = {t0_wall}")
 
-            # Reboot all connected nodes — they rejoin with the new msg1 already in
-            # the beacon.  Round 1: harmless (no nodes connected yet).
+            # Reboot nodes so they rejoin and trigger fresh EDHOC
             mari.send_reboot_all()
             if reboot_wait > 0:
-                print(f"[EVAL] Reboot sent — waiting {reboot_wait:.0f}s for nodes to restart...")
+                print(f"[EVAL] Reboot sent — waiting {reboot_wait:.0f}s ...")
                 time.sleep(reboot_wait)
-            print(f"[EVAL] Reboot wait done — round {run} active  (target={target_nodes}, timeout={round_timeout:.0f}s)")
+            print(f"[EVAL] Reboot wait done — round {run} active (target={target_nodes})")
 
             last_flush = 0.0
-
             while not eval_state["done"]:
                 mari.update()
                 now = time.time()
 
+                if not result_subscription_wired and mari.mqtt_connected:
+                    _wire_attest_result_subscription(mari, on_event_wrapper)
+                    result_subscription_wired = True
+
                 if round_timeout > 0 and now - t0 >= round_timeout:
                     attested = len(node_state["attest_done_nodes"])
-                    print(f"[EVAL] Round {run} TIMEOUT after {round_timeout:.0f}s — {attested}/{target_nodes} attested")
+                    print(f"[EVAL] Round {run} TIMEOUT — {attested}/{target_nodes} attested")
                     writer.writerow(["timeout", f"{now:.6f}", "", f"{attested}/{target_nodes}"])
                     eval_state["accepting_results"] = False
-                    eval_state["done"] = True
+                    eval_state["done"]              = True
                     break
 
                 if now - last_flush >= 2.0:
                     eval_file.flush()
                     last_flush = now
 
-                # Retry msg3 for nodes that haven't completed EDHOC yet
-                for node_id, (msg3, last_sent, retry_count) in list(edhoc_state["pending_msg3"].items()):
+                # Retry msg2 for nodes that haven't responded with msg3 yet
+                for node_id, (msg2, last_sent, retry_count) in list(edhoc_state["pending_msg2"].items()):
                     if node_id not in node_state["joined"]:
-                        edhoc_state["pending_msg3"].pop(node_id, None)
+                        edhoc_state["pending_msg2"].pop(node_id, None)
                         continue
                     if retry_count >= MSG3_MAX_RETRIES:
-                        edhoc_state["pending_msg3"].pop(node_id, None)
+                        edhoc_state["pending_msg2"].pop(node_id, None)
                         continue
                     if now - last_sent >= MSG3_RETRY_INTERVAL:
-                        mari.send_edhoc(EDHOC_MSG3, node_id, msg3)
-                        edhoc_state["pending_msg3"][node_id] = (msg3, now, retry_count + 1)
+                        mari.send_edhoc(EDHOC_MSG2, node_id, msg2)
+                        edhoc_state["pending_msg2"][node_id] = (msg2, now, retry_count + 1)
 
-                # Rotate msg1 periodically for forward secrecy
-                if now - edhoc_state["last_msg1_sent"] >= EDHOC_MSG1_RESEND_INTERVAL:
-                    initiator, msg1 = _init_edhoc(mari)
-                    edhoc_state["prev_initiator"] = edhoc_state["initiator"]
-                    edhoc_state["initiator"] = initiator
-                    edhoc_state["msg1"] = msg1
-                    mari.send_edhoc(EDHOC_MSG1, None, msg1)
-                    edhoc_state["last_msg1_sent"] = now
-
-                # In single-run mode without --auto-exit, loop forever (Ctrl+C to stop)
                 if not exit_on_done and eval_state["done"]:
                     break
 
@@ -318,18 +497,13 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log, target_nodes
 
             if run < runs:
                 label = "Warm-up" if is_warmup else f"Round {run}"
-                print(f"[EVAL] {label} complete — starting next round immediately.")
+                print(f"[EVAL] {label} complete — starting next round.")
 
     except KeyboardInterrupt:
         pass
     finally:
         mari.close_tui()
         mari.logger.close()
-
-    if runs > 1:
-        stem, ext = os.path.splitext(eval_log)
-        print(f"\n[EVAL] All {runs} runs done. CSVs saved as {stem}_001{ext or '.csv'} … {stem}_{runs:03d}{ext or '.csv'}")
-        print(f"[EVAL] Plot with:  python plot_avg_cdf.py {os.path.dirname(eval_log) or '.'}/")
 
 
 if __name__ == "__main__":
