@@ -8,7 +8,8 @@ measurement-edhoc-attestation branch):
 
 EDHOC + Attestation flow:
   1. MSG1 received (from join request):
-     - Generate 8-byte nonce, announce to verifier via MQTT.
+     - Request a fresh nonce from the verifier via MQTT (verifier generates it
+       and keeps the node_id -> nonce mapping itself).
      - Build EAD_2 = CBOR [258, h'nonce'].
      - process_message_1() -> prepare_message_2(ead_2) -> send MSG2 to node.
   2. MSG3 received (from uplink):
@@ -55,10 +56,16 @@ MSG3_MAX_RETRIES    = 30
 # app/03app_node/main.c.
 MSG3_ACK_TAG = 0xAC
 
-# MQTT topics for nonce announcement, evidence forwarding, and result retrieval
-MQTT_TOPIC_NONCE_ANNOUNCE = "/maura/nonce"
+# MQTT topics for nonce request/response, evidence forwarding, and result retrieval
+MQTT_TOPIC_NONCE_REQUEST  = "/maura/nonce_request"
+MQTT_TOPIC_NONCE_RESPONSE = "/maura/nonce_response"
 MQTT_TOPIC_EVIDENCE       = "/maura/evidence"
 MQTT_TOPIC_ATTEST_RESULT  = "/maura/attest_result"
+
+# How long to wait for the verifier's nonce_response before giving up on this
+# msg1 (verifier is on the same localhost broker, so this should resolve in
+# low milliseconds under normal operation).
+NONCE_REQUEST_TIMEOUT = 3.0
 
 # Edge = EDHOC Responder.
 # Uses the credentials previously held by the mari node (roles reversed).
@@ -126,6 +133,7 @@ def on_event(
     node_state: dict,
     eval_state: dict,
     target_nodes: int,
+    nonce_responses: dict,
 ):
     writer = eval_state["writer"]
 
@@ -177,9 +185,13 @@ def on_event(
                 print(f"[MAURA] process_message_1 failed for 0x{node_id:016X}: {e}")
                 return
 
-            # Generate nonce and announce to verifier
-            nonce = os.urandom(8)
-            _announce_nonce(mari, node_id, nonce)
+            # Request a fresh nonce from the verifier -- it generates the value
+            # and keeps the node_id -> nonce mapping itself, rather than us
+            # picking the value and just informing it.
+            nonce = _request_nonce_from_verifier(mari, node_id, nonce_responses)
+            if nonce is None:
+                print(f"[MAURA] nonce request timed out for 0x{node_id:016X}")
+                return
 
             # Build EAD_2 = CBOR [258, h'nonce']
             ead_2_value = cbor2.dumps([258, nonce])
@@ -276,15 +288,64 @@ def on_event(
             eval_state["done"]              = True
 
 
-def _announce_nonce(mari: MarilibEdge, node_id: int, nonce: bytes) -> None:
-    """Send nonce announcement to verifier via MQTT so it can store node_id->nonce."""
+def _request_nonce_from_verifier(mari: MarilibEdge, node_id: int, nonce_responses: dict) -> bytes | None:
+    """Ask the verifier for a fresh nonce and block until it replies (or times out).
+
+    The verifier generates the nonce and keeps its own node_id -> nonce mapping;
+    nonce_responses is populated by the subscription wired in
+    _wire_nonce_response_subscription() below, running on the MQTT client's
+    background thread, so this busy-wait just polls that dict.
+    """
     if not mari.uses_mqtt:
-        return
-    payload = cbor2.dumps({"node_id": node_id, "nonce": nonce})
+        return None
+    payload = cbor2.dumps({"node_id": node_id})
     try:
-        mari.mqtt_interface.client.publish(MQTT_TOPIC_NONCE_ANNOUNCE, payload)
+        mari.mqtt_interface.client.publish(MQTT_TOPIC_NONCE_REQUEST, payload)
     except Exception as e:
-        print(f"[MAURA] MQTT nonce announce failed: {e}")
+        print(f"[MAURA] MQTT nonce request failed: {e}")
+        return None
+
+    deadline = time.time() + NONCE_REQUEST_TIMEOUT
+    while time.time() < deadline:
+        nonce = nonce_responses.pop(node_id, None)
+        if nonce is not None:
+            return nonce
+        time.sleep(0.001)
+    return None
+
+
+def _wire_nonce_response_subscription(mari: MarilibEdge, nonce_responses: dict) -> None:
+    """
+    Subscribe to /maura/nonce_response on the edge's existing MQTT client.
+
+    Same self-healing-across-reconnects pattern as _wire_attest_result_subscription
+    below: chained onto on_connect so a broker reconnect doesn't silently drop it.
+    """
+    client = mari.mqtt_interface.client
+
+    def _on_nonce_response(_client, _userdata, message):
+        try:
+            payload = cbor2.loads(message.payload)
+            node_id = int(payload["node_id"])
+            nonce   = bytes(payload["nonce"])
+        except Exception as e:
+            print(f"[MAURA] Malformed nonce_response payload: {e}")
+            return
+        nonce_responses[node_id] = nonce
+
+    def _subscribe():
+        client.message_callback_add(MQTT_TOPIC_NONCE_RESPONSE, _on_nonce_response)
+        client.subscribe(MQTT_TOPIC_NONCE_RESPONSE, qos=0)
+
+    _prior_on_connect = client.on_connect
+
+    def _on_connect_chained(c, userdata, flags, reason_code, properties):
+        if _prior_on_connect:
+            _prior_on_connect(c, userdata, flags, reason_code, properties)
+        _subscribe()
+
+    client.on_connect = _on_connect_chained
+    _subscribe()
 
 
 def _send_evidence_to_verifier(mari: MarilibEdge, node_id: int, evidence: bytes, binder: bytes) -> None:
@@ -379,9 +440,10 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log,
         "run": 0, "total_runs": runs,
         "accepting_results": False,
     }
+    nonce_responses: dict = {}
 
     def on_event_wrapper(event, event_data):
-        on_event(event, event_data, mari, edhoc_state, node_state, eval_state, target_nodes)
+        on_event(event, event_data, mari, edhoc_state, node_state, eval_state, target_nodes, nonce_responses)
 
     mari = MarilibEdge(
         on_event_wrapper,
@@ -397,15 +459,18 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log,
     exit_on_done = auto_exit or (runs > 1)
     result_subscription_wired = False
 
-    # Wire the attest_result subscription before the first round's reboot_wait sleep below.
-    # Otherwise nodes that finish EDHOC + attestation during that blocking sleep (before the
-    # per-round loop -- where this used to be wired -- ever runs) get their result published
-    # by the verifier while mari_edge isn't subscribed yet, and MQTT doesn't back-deliver
-    # messages published before a subscription existed, so the result is silently lost.
+    # Wire the attest_result and nonce_response subscriptions before the first round's
+    # reboot_wait sleep below. Otherwise nodes that finish EDHOC + attestation (or send
+    # msg1 needing a nonce) during that blocking sleep -- before the per-round loop, where
+    # these used to be wired, ever runs -- get their message published while mari_edge
+    # isn't subscribed yet, and MQTT doesn't back-deliver messages published before a
+    # subscription existed, so the message is silently lost (this bit us once already
+    # for attest_result; wiring nonce_response the same way here to avoid repeating it).
     if mari.uses_mqtt:
         while not mari.mqtt_connected:
             mari.update()
             time.sleep(0.01)
+        _wire_nonce_response_subscription(mari, nonce_responses)
         _wire_attest_result_subscription(mari, on_event_wrapper)
         result_subscription_wired = True
 
@@ -431,6 +496,7 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log,
             node_state.update({"joined": set(), "edhoc_done": set(), "attest_done_nodes": set()})
             eval_state.update({"t0": None, "done": False, "writer": writer, "run": run,
                                 "accepting_results": False})
+            nonce_responses.clear()
 
             print(f"\n{'#'*62}")
             if is_warmup:

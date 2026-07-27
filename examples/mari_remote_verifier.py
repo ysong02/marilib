@@ -1,13 +1,19 @@
 """
 Related-work Remote Verifier.
 
-Receives nonce announcements and attestation evidence from the edge via MQTT.
-Counterpart to examples/mari_edge.py (EDHOC Responder, node = Initiator design).
+Generates fresh nonces on request and verifies attestation evidence from the
+edge via MQTT. Counterpart to examples/mari_edge.py (EDHOC Responder, node =
+Initiator design).
 
 Protocol:
-  - /maura/nonce        : edge -> verifier, CBOR {node_id, nonce} -- register fresh nonce
-  - /maura/evidence     : edge -> verifier, CBOR {node_id, evidence, binder} -- verify token
-  - /maura/attest_result: verifier -> edge, CBOR {node_id, result} -- send back result
+  - /maura/nonce_request : edge -> verifier, CBOR {node_id} -- request a fresh nonce
+  - /maura/nonce_response: verifier -> edge, CBOR {node_id, nonce} -- the generated nonce
+  - /maura/evidence      : edge -> verifier, CBOR {node_id, evidence, binder} -- verify token
+  - /maura/attest_result : verifier -> edge, CBOR {node_id, result} -- send back result
+
+The verifier -- not the edge -- generates the nonce and keeps the node_id -> nonce
+mapping itself, so freshness is anchored to the verifier's own RNG rather than
+trusting a value the edge picked.
 
 Verification:
   1. Look up stored nonce for node_id.
@@ -17,6 +23,7 @@ Verification:
   5. Verify Ed25519 signature.
 """
 
+import os
 import threading
 import time
 from typing import Optional
@@ -28,9 +35,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 
 # MQTT topics (must match examples/mari_edge.py)
-TOPIC_NONCE    = "/maura/nonce"
-TOPIC_EVIDENCE = "/maura/evidence"
-TOPIC_RESULT   = "/maura/attest_result"
+TOPIC_NONCE_REQUEST  = "/maura/nonce_request"
+TOPIC_NONCE_RESPONSE = "/maura/nonce_response"
+TOPIC_EVIDENCE       = "/maura/evidence"
+TOPIC_RESULT         = "/maura/attest_result"
 
 # Ed25519 public key — matches _public_key[] in mari/app/03app_node/attestation.c
 ATTESTATION_PUBLIC_KEY = bytes([
@@ -120,6 +128,13 @@ class MauraVerifier:
         with self._lock:
             self._nonce_store[node_id] = nonce
 
+    def generate_nonce(self, node_id: int) -> bytes:
+        """Generate a fresh nonce for node_id, store it, and return it for
+        publishing back to the edge."""
+        nonce = os.urandom(8)
+        self.register_nonce(node_id, nonce)
+        return nonce
+
     def verify_evidence(self, node_id: int, evidence: bytes, binder: bytes) -> bool:
         with self._lock:
             expected_nonce = self._nonce_store.get(node_id)
@@ -181,9 +196,9 @@ def main(mqtt_url: str):
     def on_connect(c, userdata, flags, rc):
         if rc == 0:
             print(f"[VERIFIER] Connected to MQTT broker {host}:{port}")
-            c.subscribe(TOPIC_NONCE)
+            c.subscribe(TOPIC_NONCE_REQUEST)
             c.subscribe(TOPIC_EVIDENCE)
-            print(f"[VERIFIER] Subscribed to {TOPIC_NONCE} and {TOPIC_EVIDENCE}")
+            print(f"[VERIFIER] Subscribed to {TOPIC_NONCE_REQUEST} and {TOPIC_EVIDENCE}")
         else:
             print(f"[VERIFIER] MQTT connect failed: rc={rc}")
 
@@ -194,11 +209,14 @@ def main(mqtt_url: str):
             print(f"[VERIFIER] CBOR decode failed on {msg.topic}: {e}")
             return
 
-        if msg.topic == TOPIC_NONCE:
+        if msg.topic == TOPIC_NONCE_REQUEST:
             node_id = payload.get("node_id")
-            nonce   = payload.get("nonce")
-            if node_id is not None and nonce is not None:
-                verifier.register_nonce(int(node_id), bytes(nonce))
+            if node_id is None:
+                print("[VERIFIER] Incomplete nonce_request payload")
+                return
+            node_id = int(node_id)
+            nonce = verifier.generate_nonce(node_id)
+            c.publish(TOPIC_NONCE_RESPONSE, cbor2.dumps({"node_id": node_id, "nonce": nonce}))
 
         elif msg.topic == TOPIC_EVIDENCE:
             node_id  = payload.get("node_id")
