@@ -13,9 +13,6 @@ from marilib.mari_protocol import (
     DefaultPayload,
     DefaultPayloadType,
 )
-
-# EDHOC subtype for MSG4 (mirror of MARI_EDHOC_SUBTYPE_MSG4 in models.h)
-_EDHOC_MSG4 = 4
 from marilib.model import (
     EdgeEvent,
     GatewayInfo,
@@ -28,8 +25,6 @@ from marilib.protocol import ProtocolPayloadParserException
 from marilib.communication_adapter import MQTTAdapter, MQTTAdapterDummy, SerialAdapter
 from marilib.marilib import MarilibBase
 from marilib.tui_edge import MarilibTUIEdge
-# for attestation
-# from marilib.marilib_attest_rp import mr_is_attest_verif_resp, mr_process_attest_verif_resp
 
 @dataclass
 class MarilibEdge(MarilibBase):
@@ -180,11 +175,6 @@ class MarilibEdge(MarilibBase):
             frame.header.destination
         ):
             return
-        # # for attestation verification response (disabled)
-        # if mr_is_attest_verif_resp(frame.payload):
-        #     result_payload = mr_process_attest_verif_resp(frame.payload)
-        #     self.send_frame(frame.header.destination, result_payload)
-        # else:
         self.send_frame(frame.header.destination, frame.payload)
 
     def _send_kick_to_gateway(self, node_id: int):
@@ -213,6 +203,12 @@ class MarilibEdge(MarilibBase):
 
         elif event_type == EdgeEvent.NODE_LEFT:
             node_info = NodeInfoEdge().from_bytes(data[1:])
+            # Reason tag appended after the 8-byte address (see mr_event_tag_t
+            # in the gateway's models.h). NodeInfoEdge.from_bytes() only reads
+            # its declared 8 bytes and ignores anything past that, so adding
+            # this attribute here is safe -- it doesn't touch the wire format
+            # NODE_JOINED and other messages still rely on.
+            node_info.left_reason = data[9] if len(data) > 9 else None
             if self.remove_node(node_info.address):
                 return True, event_type, node_info
             else:
@@ -250,24 +246,14 @@ class MarilibEdge(MarilibBase):
                 return False, EdgeEvent.UNKNOWN, None
 
         elif event_type == EdgeEvent.EDHOC:
-            # data: [EDHOC=6][subtype][node_id: 8 bytes][...]
-            # MSG4 format: [EDHOC=6][MSG4=4][node_id: 8 bytes][asn_dl: 8 bytes][asn_ul: 8 bytes][edhoc_bytes...]
-            # other subtypes: [EDHOC=6][subtype][node_id: 8 bytes][edhoc_bytes...]
+            # data: [EDHOC=6][subtype][node_id: 8 bytes][edhoc_bytes...]
+            # (CRAFT only ever uses subtypes 1-3: connect request/reply/attest tag)
             if len(data) < 10:
                 return False, event_type, None
-            subtype = data[1]
-            node_id = int.from_bytes(data[2:10], "little")
-            if subtype == _EDHOC_MSG4:
-                if len(data) < 26:
-                    return False, event_type, None
-                asn_dl = int.from_bytes(data[10:18], "little")
-                asn_ul = int.from_bytes(data[18:26], "little")
-                edhoc_data = data[26:]
-            else:
-                asn_dl = 0
-                asn_ul = 0
-                edhoc_data = data[10:]
-            return True, event_type, (subtype, node_id, edhoc_data, asn_dl, asn_ul)
+            subtype    = data[1]
+            node_id    = int.from_bytes(data[2:10], "little")
+            edhoc_data = data[10:]
+            return True, event_type, (subtype, node_id, edhoc_data, 0, 0)
 
         return False, event_type, None
 
