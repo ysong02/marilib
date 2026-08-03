@@ -21,10 +21,7 @@ LOAD_PACKET_PAYLOAD = b"L"
 
 @dataclass
 class MarilibCloud(MarilibBase):
-    """
-    The MarilibCloud class runs in a computer.
-    It is used to communicate with a Mari radio gateway (nRF5340) via MQTT.
-    """
+    """Runs on a computer; talks to a Mari radio gateway (nRF5340) via MQTT."""
 
     cb_application: Callable[[EdgeEvent, MariNode | Frame | GatewayInfo], None]
     mqtt_interface: MQTTAdapter
@@ -59,7 +56,7 @@ class MarilibCloud(MarilibBase):
     # ============================ MarilibBase methods =========================
 
     def update(self):
-        """Recurrent bookkeeping. Don't forget to call this periodically on your main loop."""
+        """Recurrent bookkeeping; call periodically from your main loop."""
         with self.lock:
             # remove dead gateways
             self.gateways = {
@@ -92,10 +89,7 @@ class MarilibCloud(MarilibBase):
         return None
 
     def send_frame(self, dst: int, payload: bytes):
-        """
-        Sends a frame to a gateway via MQTT.
-        Consists in publishing a message to the /mari/{network_id}/to_edge topic.
-        """
+        """Sends a frame to a gateway via MQTT (publishes to /mari/{network_id}/to_edge)."""
         mari_frame = Frame(Header(destination=dst), payload=payload)
 
         self.mqtt_interface.send_data_to_edge(
@@ -129,12 +123,7 @@ class MarilibCloud(MarilibBase):
     # ============================ Callbacks ===================================
 
     def handle_mqtt_data(self, data: bytes) -> tuple[bool, EdgeEvent, Any]:
-        """
-        Handles the MQTT data received from the MQTT broker:
-        - parses the event
-        - updates node or gateway information
-        - returns the event type and data (if any)
-        """
+        """Parses an MQTT event, updates node/gateway state, and returns (ok, event_type, data)."""
 
         if len(data) < 1:
             return False, EdgeEvent.UNKNOWN, None

@@ -1,8 +1,4 @@
-"""
-Related-work Remote Verifier.
-
-Receives nonce announcements and attestation evidence from the edge via MQTT.
-Counterpart to examples/mari_edge.py (EDHOC Responder, node = Initiator design).
+"""Related-work Remote Verifier: receives nonce announcements and attestation evidence from the edge via MQTT (counterpart to mari_edge.py).
 
 Protocol:
   - /maura/nonce        : edge -> verifier, CBOR {node_id, nonce} -- register fresh nonce
@@ -49,10 +45,7 @@ EXPECTED_HASH = bytes([
 # ========================= COSE_Sign1 decoder ================================
 
 def _decode_cose_sign1(token: bytes):
-    """
-    Decode a COSE_Sign1 token (tag 18 / 0xd2 0x84 header).
-    Returns (protected_header_bytes, unprotected, payload_bytes, signature_bytes).
-    """
+    """Decode a COSE_Sign1 token; returns (protected_header, unprotected, payload, signature)."""
     decoded = cbor2.loads(token)
     # cbor2 may decode as CBORTag(18, [...]) or directly as a list
     if hasattr(decoded, "value"):
@@ -71,12 +64,7 @@ def _build_sig_structure(protected: bytes, external_aad: bytes, payload: bytes) 
 
 
 def verify_cose_sign1(token: bytes, binder: bytes) -> tuple[bool, Optional[bytes]]:
-    """
-    Verify a COSE_Sign1 token.
-
-    Returns (ok, nonce_from_payload) where nonce_from_payload is the nonce
-    extracted from the EAT claim map (used for freshness check).
-    """
+    """Verify a COSE_Sign1 token; returns (ok, nonce_from_payload) for the freshness check."""
     try:
         protected, _unprotected, payload_bstr, signature = _decode_cose_sign1(token)
     except Exception as e:

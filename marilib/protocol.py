@@ -46,9 +46,7 @@ class Packet(ABC):
 
     def from_bytes(self, bytes_):
         fields = dataclasses.fields(self)
-        # base class makes metadata attribute mandatory so there's at least one
-        # field defined in subclasses
-        # first elements in fields has to be metadata
+        # metadata must be the first field (base class requires at least one).
         if not fields or fields[0].name != "metadata":
             raise ValueError("metadata must be defined first")
         metadata = fields[0].default_factory()

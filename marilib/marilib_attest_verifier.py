@@ -269,13 +269,7 @@ private_key_verifier = bytes.fromhex('8ed2d03fa136f5232f957e41d368940153d580e6b5
 public_key_verifier = bytes.fromhex('2463f9d5e61b84689b3b19ae10a3d6b5bfd1e69a643d7061aca4d04f7fd98db9')
 
 def mr_swarm_verification_result_edhoc(payload):
-    """Verify attestation evidence received via EDHOC EAD4.
-
-    payload[0] == 0xE4; payload[1:] is CBOR [asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder]
-    evidence_cbor is CBOR [fw_version, key_id, signature]
-    signature covers CBOR [asn_dl, key_id, hash_firmware, node_id, attestation_binder]
-    Returns True if verification passes.
-    """
+    """Verify attestation evidence from EDHOC EAD4 (payload[1:] = CBOR [asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder])."""
     asn_dl, asn_ul, evidence_cbor, node_id, attestation_binder = cbor2.loads(payload[1:])
     fw_version, key_id, signature = cbor2.loads(evidence_cbor)
 

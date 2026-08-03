@@ -28,12 +28,7 @@ from marilib.tui_edge import MarilibTUIEdge
 
 @dataclass
 class MarilibEdge(MarilibBase):
-    """
-    The MarilibEdge class runs in either a computer or a raspberry pi.
-    It is used to communicate with:
-    - a Mari radio gateway (nRF5340) via serial
-    - a Mari cloud instance via MQTT (optional)
-    """
+    """Runs on a computer or Raspberry Pi; talks to a Mari gateway via serial and, optionally, a Mari cloud instance via MQTT."""
 
     cb_application: Callable[[EdgeEvent, MariNode | Frame], None]
     serial_interface: SerialAdapter
@@ -203,11 +198,7 @@ class MarilibEdge(MarilibBase):
 
         elif event_type == EdgeEvent.NODE_LEFT:
             node_info = NodeInfoEdge().from_bytes(data[1:])
-            # Reason tag appended after the 8-byte address (see mr_event_tag_t
-            # in the gateway's models.h). NodeInfoEdge.from_bytes() only reads
-            # its declared 8 bytes and ignores anything past that, so adding
-            # this attribute here is safe -- it doesn't touch the wire format
-            # NODE_JOINED and other messages still rely on.
+            # Reason tag appended after the 8-byte address (mr_event_tag_t); safe since from_bytes() ignores extra bytes.
             node_info.left_reason = data[9] if len(data) > 9 else None
             if self.remove_node(node_info.address):
                 return True, event_type, node_info
@@ -255,6 +246,16 @@ class MarilibEdge(MarilibBase):
             edhoc_data = data[10:]
             return True, event_type, (subtype, node_id, edhoc_data, 0, 0)
 
+        elif event_type == EdgeEvent.CRAFT_DIAG:
+            # data: [CRAFT_DIAG=10][node_id: 8 bytes][joined: 1][len: 1]
+            # Debug-free relay of an uplink RX event (see MARI_CRAFT_DIAG_UPLINK_RX in mari/models.h).
+            if len(data) < 11:
+                return False, event_type, None
+            node_id = int.from_bytes(data[1:9], "little")
+            joined  = data[9]
+            rx_len  = data[10]
+            return True, event_type, (node_id, joined, rx_len)
+
         return False, event_type, None
 
     def send_edhoc(self, subtype: int, node_id: int | None, edhoc_data: bytes):
@@ -298,6 +299,10 @@ class MarilibEdge(MarilibBase):
 
         if event_type == EdgeEvent.EDHOC:
             self.cb_application(event_type, event_data)
+
+        if event_type == EdgeEvent.CRAFT_DIAG:
+            self.cb_application(event_type, event_data)
+            return  # local diagnostic only, nothing to log/forward to cloud
 
         self.send_data_to_cloud(event_type, event_data)
 

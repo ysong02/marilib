@@ -59,10 +59,7 @@ class PDRTester:
         self.marilib.send_frame(address, PDR_STATS_REQUEST_PAYLOAD)
 
     def handle_response(self, frame: Frame) -> bool:
-        """
-        Handles a PDR stats response frame and calculates PDR values.
-        Returns True if the frame was a valid stats reply, False otherwise.
-        """
+        """Handles a PDR stats response frame and calculates PDR values; returns False if invalid."""
         if len(frame.payload) != 8:
             return False
 

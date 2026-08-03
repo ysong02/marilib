@@ -75,6 +75,7 @@ class EdgeEvent(IntEnum):
     KICK_NODE = 7
     ATTEST_RESULT = 8
     REBOOT_ALL = 9
+    CRAFT_DIAG = 10
     UNKNOWN = 255
 
     @classmethod
@@ -542,7 +543,7 @@ class MariGateway:
         return sum(n.probe_stats_latest.gw_rx_count for n in self.nodes if n.probe_stats_latest)
 
     def update(self):
-        """Recurrent bookkeeping. Don't forget to call this periodically on your main loop."""
+        """Recurrent bookkeeping; call this periodically from your main loop."""
         self.node_registry = {
             addr: node for addr, node in self.node_registry.items() if node.is_alive
         }

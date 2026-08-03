@@ -8,7 +8,7 @@ class MarilibBase(ABC):
 
     @abstractmethod
     def update(self):
-        """Recurrent bookkeeping. Don't forget to call this periodically on your main loop."""
+        """Recurrent bookkeeping; call periodically from your main loop."""
 
     @abstractmethod
     def nodes(self) -> list[MariNode]:

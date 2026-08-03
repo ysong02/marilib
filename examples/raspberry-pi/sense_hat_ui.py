@@ -1,9 +1,4 @@
-# this only works on raspberry pi
-# to install the emulator sense_emu library:
-# - sudo apt-get install python3-gi python3-gi-cairo
-# - pip install sense-emu
-# to install the real sense_hat library:
-# - sudo apt-get install sense-hat
+# Raspberry Pi only. Emulator: apt install python3-gi python3-gi-cairo && pip install sense-emu. Real hardware: apt install sense-hat.
 
 from sense_emu import SenseHat
 import threading
@@ -73,12 +68,7 @@ def _set_top(x, color):
 
 
 def display_num_nodes():
-    """
-    update the top bar so that every (nb_nodes//nb_row) nodes that joined or left
-    changes the bar by 1 pixel.
-    example: if nb_max of nodes is 66 then 66//8 = 8 so every 8 nodes joining lights up one more pixel
-    and every 8 nodes leaving resets 1 pixel
-    """
+    """Updates the top bar by 1 pixel per nb_nodes_per_pixel nodes joined/left."""
     global prev_pixels
 
     with state_lock:
@@ -137,10 +127,7 @@ def text_to_columns(text):
 
 
 def display_scrolling_message(text, fg, bg, speed, scrolling_times):
-    """
-    Scroll a 6x6 message across the Sense HAT.
-    Draws ONLY on rows y=2..7 (leaves y=0 and y=1 unchanged).
-    """
+    """Scrolls a 6x6 message across the Sense HAT, on rows y=2..7 only."""
     text = " " + text
     cols = text_to_columns(text)
     cols.extend([[False] * 6 for _ in range(8)])  # right padding so it scrolls off
@@ -160,10 +147,7 @@ def display_scrolling_message(text, fg, bg, speed, scrolling_times):
 
 
 def display_static_message(text, fg, bg):
-    """
-    Show a 6x6 message without scrolling.
-    Draws only on rows y=2..7, rows 0 and 1 are not used
-    """
+    """Shows a 6x6 message without scrolling, on rows y=2..7 only."""
     cols = text_to_columns(text)
     width = 8
     # draw 8 columns
@@ -182,12 +166,7 @@ def display_static_message(text, fg, bg):
 def message_thread(
     static_text, scroll_text, fg_static, fg_scroll, bg, scroll_speed, scroll_repeats
 ):
-    """
-    alternates:
-      1) draw static message; schedule
-      2) scroll another message: network id (net_id) scroll_repeats times at scroll_speed
-    Loops forever.
-    """
+    """Alternates a static message with a scrolling one, forever."""
     while True:
         display_static_message(static_text, fg_static, bg)
         time.sleep(3)

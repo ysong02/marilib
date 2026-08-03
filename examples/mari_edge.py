@@ -1,14 +1,11 @@
-"""
-CRAFT+SEDA Edge — connect (join) relying party + attest relay.
+"""CRAFT+SEDA Edge: connect (join) relying party + attest relay between node and verifier."""
 
-Verifies the node's connect request against PK_O, fetches a SEDA challenge
-from the verifier over MQTT, and replies with the connect reply + challenge
-as the join response. Relays the node's attest tag to the verifier and acts
-on the pass/fail result.
-"""
-
+import csv
+import os
 import struct
 import time
+from datetime import datetime
+from pathlib import Path
 
 import cbor2
 import click
@@ -44,9 +41,7 @@ SIG_EXPIRATION = 0xFFFFFFFF  # far-future constant, see attestation.c
 
 # Must stay below the node's CONNECT_REPLY_TIMEOUT_SLOTS (app/03app_node/main.c).
 CONNECT_REPLY_RETRY_INTERVAL = 2.0
-CONNECT_REPLY_MAX_RETRIES    = 30
-
-ATTEST_ACK_TAG = 0xAC  # must match CRAFT_ATTEST_ACK_TAG in app/03app_node/main.c
+CONNECT_REPLY_MAX_RETRIES    = 5
 
 MQTT_TOPIC_CHALLENGE_REQUEST  = "/craft/challenge_request"
 MQTT_TOPIC_CHALLENGE_RESPONSE = "/craft/challenge_response"
@@ -57,6 +52,28 @@ CHALLENGE_REQUEST_TIMEOUT = 3.0
 
 _operator_public_key = ed25519.Ed25519PublicKey.from_public_bytes(OPERATOR_PUBLIC_KEY)
 _edge_x25519_private_key = x25519.X25519PrivateKey.from_private_bytes(EDGE_X25519_PRIVATE_KEY)
+
+
+# ========================= per-run CSV logging ================================
+
+def _csv_path_for_run(eval_log: str, run: int) -> str:
+    """--eval-log dir/prefix.csv -> dir/prefix_{run:03d}.csv."""
+    stem, ext = os.path.splitext(eval_log)
+    return f"{stem}_{run:03d}{ext or '.csv'}"
+
+
+def _start_round_csv(eval_log: str | None, round_num: int, t0: float):
+    """Open a fresh per-round CSV with a t0 row; returns (None, None) if eval_log is unset."""
+    if eval_log is None:
+        return None, None
+    path = _csv_path_for_run(eval_log, round_num)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "w", newline="")
+    writer = csv.writer(f)
+    writer.writerow(["type", "timestamp", "node_id", "elapsed_s"])
+    writer.writerow(["t0", f"{t0:.6f}", "", ""])
+    f.flush()
+    return f, writer
 
 
 # ========================= connect wire helpers ================================
@@ -96,13 +113,16 @@ def _derive_k_ij(pk_i: bytes) -> bytes:
 
 # ========================= Event handler =====================================
 
-def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dict):
+def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dict, target_nodes: int, reboot_wait: float):
     if event == EdgeEvent.NODE_JOINED:
-        print(f"[CRAFT] NODE_JOINED 0x{event_data.address:016X}")
+        if connect_state["csv_writer"] is not None and connect_state["t0"] is not None:
+            now = time.time()
+            elapsed = now - connect_state["t0"]
+            connect_state["csv_writer"].writerow(
+                ["node_joined", f"{now:.6f}", f"0x{event_data.address:016X}", f"{elapsed:.3f}"])
+            connect_state["csv_file"].flush()
 
     elif event == EdgeEvent.NODE_LEFT:
-        reason = getattr(event_data, "left_reason", None)
-        print(f"[CRAFT] NODE_LEFT 0x{event_data.address:016X} reason={reason}")
         connect_state["sessions"].pop(event_data.address, None)
         connect_state["pending_reply"].pop(event_data.address, None)
         connect_state["pending_challenge"].pop(event_data.address, None)
@@ -112,9 +132,7 @@ def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dic
         subtype, node_id, msg_bytes, _asn_dl, _asn_ul = event_data
 
         if subtype == EDHOC_MSG1:
-            # No cached-reply fast path: connect requests are byte-identical
-            # across reboots, so resending a cached reply could recycle a
-            # stale/consumed challenge. Always re-verify and fetch fresh.
+            # No cached-reply fast path: a stale reply could recycle a consumed challenge, so always re-verify.
             pending = connect_state["pending_challenge"].get(node_id)
             if pending is not None and pending["request"] == msg_bytes:
                 if time.time() - pending["ts"] < CHALLENGE_REQUEST_TIMEOUT:
@@ -128,45 +146,47 @@ def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dic
 
             _derive_k_ij(pk_i)  # unused downstream, kept for protocol fidelity
 
-            # Non-blocking: publish and return so the serial reader thread
-            # isn't blocked; the reply is sent later from the MQTT callback.
+            # Non-blocking: publish and return so the serial reader thread isn't blocked.
             if not _request_challenge_from_verifier(mari, node_id):
                 return
             connect_state["pending_challenge"][node_id] = {"request": msg_bytes, "ts": time.time()}
 
         elif subtype == EDHOC_MSG3:
-            print(f"[CRAFT] attest tag from 0x{node_id:016X} ({len(msg_bytes)} B): {msg_bytes.hex()}")
             connect_state["pending_reply"].pop(node_id, None)
 
             if node_id in connect_state["completed"]:
-                # Already forwarded -- this is a retransmit of a lost ack, not
-                # a new tag. Re-ack only; don't resubmit (challenge is consumed).
-                mari.send_frame(node_id, bytes([ATTEST_ACK_TAG]))
+                # Node resends its tag a few times regardless of outcome; already forwarded, ignore the repeat.
                 return
 
             session = connect_state["sessions"].pop(node_id, None)
             if session is None:
-                print(f"[CRAFT] DROP attest tag from 0x{node_id:016X}: no live session")
                 return
 
             if len(msg_bytes) != ATTEST_TAG_SIZE:
-                print(f"[CRAFT] DROP attest tag from 0x{node_id:016X}: wrong length {len(msg_bytes)}")
                 return
 
             connect_state["completed"].add(node_id)
-            mari.send_frame(node_id, bytes([ATTEST_ACK_TAG]))
             _send_attest_to_verifier(mari, node_id, msg_bytes)
 
     elif event == EdgeEvent.ATTEST_RESULT:
         node_id, result = event_data
         if not result:
             mari._send_kick_to_gateway(node_id)
-        print(f"[CRAFT] Attest result for 0x{node_id:016X}: {'PASS' if result else 'FAIL'}")
+
+        if node_id in connect_state["attested"]:
+            return  # duplicate/late result (e.g. straggler from a prior round)
+        connect_state["attested"].add(node_id)
+        count = len(connect_state["attested"])
+        ts = datetime.now().strftime("%H:%M:%S")
+        round_label = "warmup" if connect_state["round"] == 1 else f"run {connect_state['round'] - 1}"
+        print(f"[CRAFT] 0x{node_id:016X} {'PASS' if result else 'FAIL'} at {ts} ({count}/{target_nodes}, {round_label})")
+
+        if count >= target_nodes and connect_state["reboot_at"] is None:
+            connect_state["reboot_at"] = time.time() + reboot_wait
 
 
 def _request_challenge_from_verifier(mari: MarilibEdge, node_id: int) -> bool:
-    """Publish a challenge request to the verifier. Non-blocking -- the reply
-    is handled asynchronously by _on_challenge_response when it arrives."""
+    """Publish a challenge request to the verifier; reply is handled asynchronously."""
     if not mari.uses_mqtt:
         return False
     payload = cbor2.dumps({"node_id": node_id})
@@ -179,12 +199,7 @@ def _request_challenge_from_verifier(mari: MarilibEdge, node_id: int) -> bool:
 
 
 def _wire_challenge_response_subscription(mari: MarilibEdge, connect_state: dict) -> None:
-    """Subscribe to /craft/challenge_response, self-healing across MQTT reconnects.
-
-    Runs on the MQTT client's own background thread, not the serial reader
-    thread -- builds and sends the connect reply here so the reader thread
-    is never blocked waiting for the verifier.
-    """
+    """Subscribe to /craft/challenge_response and send the connect reply from the MQTT thread, so the serial reader never blocks."""
     client = mari.mqtt_interface.client
 
     def _on_challenge_response(_client, _userdata, message):
@@ -267,7 +282,16 @@ def _wire_attest_result_subscription(mari: MarilibEdge, on_event_wrapper) -> Non
 @click.command()
 @click.option("--port", "-p", type=str, default=get_default_port(), show_default=True)
 @click.option("--mqtt-url", "-m", type=str, default=None)
-def main(port, mqtt_url):
+@click.option("--target-nodes", "-N", type=int, default=1, show_default=True,
+              help="Number of nodes expected to attest before reboot_all is sent")
+@click.option("--runs", "-r", type=int, default=0, show_default=True,
+              help="Number of reboot cycles to run (0 = run forever, Ctrl+C to stop)")
+@click.option("--reboot-wait", type=float, default=1.0, show_default=True,
+              help="Seconds to wait after the target node count attests before sending reboot_all")
+@click.option("--eval-log", type=click.Path(), default=None,
+              help="CSV prefix for per-run joining-time logs, e.g. craft_nodes_010/craft_run.csv "
+                   "-> craft_nodes_010/craft_run_001.csv, _002.csv, ... (one file per run)")
+def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log):
     """CRAFT+SEDA Edge: connect relying party + attest relay (node = initiator)."""
 
     connect_state: dict = {
@@ -275,10 +299,17 @@ def main(port, mqtt_url):
         "pending_reply":     {},
         "pending_challenge": {},
         "completed":         set(),
+        "attested":          set(),
+        "reboot_at":         None,
+        "round":             1,
+        "stop":              False,
+        "csv_file":          None,
+        "csv_writer":        None,
+        "t0":                None,
     }
 
     def on_event_wrapper(event, event_data):
-        on_event(event, event_data, mari, connect_state)
+        on_event(event, event_data, mari, connect_state, target_nodes, reboot_wait)
 
     mari = MarilibEdge(
         on_event_wrapper,
@@ -291,8 +322,7 @@ def main(port, mqtt_url):
         metrics_probe_period=0,
     )
 
-    # Wire subscriptions before the main loop -- MQTT doesn't back-deliver
-    # messages published before a subscription existed.
+    # Wire subscriptions before the main loop -- MQTT won't back-deliver messages published earlier.
     if mari.uses_mqtt:
         while not mari.mqtt_connected:
             mari.update()
@@ -300,25 +330,55 @@ def main(port, mqtt_url):
         _wire_challenge_response_subscription(mari, connect_state)
         _wire_attest_result_subscription(mari, on_event_wrapper)
 
-    print("[CRAFT] Edge ready — waiting for node connect requests.")
+    run_label = f"{runs} + 1 warmup" if runs > 0 else "unlimited"
+    print(f"[CRAFT] Edge ready — waiting for node connect requests. (target_nodes={target_nodes}, runs={run_label})")
+
+    # Round 1 is always a warmup: not counted towards --runs, not logged to CSV.
+    connect_state["t0"] = time.time()
+
     try:
-        while True:
+        while not connect_state["stop"]:
             mari.update()
             now = time.time()
 
             # Retry the connect reply for nodes that haven't sent an attest tag yet
             for node_id, (reply, last_sent, retry_count) in list(connect_state["pending_reply"].items()):
                 if retry_count >= CONNECT_REPLY_MAX_RETRIES:
+                    print(f"[CRAFT] 0x{node_id:016X} unreachable after {CONNECT_REPLY_MAX_RETRIES} tries -- rebooting round")
                     connect_state["pending_reply"].pop(node_id, None)
+                    if connect_state["reboot_at"] is None:
+                        connect_state["reboot_at"] = now
                     continue
                 if now - last_sent >= CONNECT_REPLY_RETRY_INTERVAL:
                     mari.send_edhoc(EDHOC_MSG2, node_id, reply)
                     connect_state["pending_reply"][node_id] = (reply, now, retry_count + 1)
 
+            # Fire the reboot once the target node count has attested (see on_event),
+            # from the main loop rather than the MQTT callback thread.
+            if connect_state["reboot_at"] is not None and now >= connect_state["reboot_at"]:
+                mari.send_reboot_all()
+                connect_state["attested"] = set()
+                connect_state["completed"] = set()
+                connect_state["reboot_at"] = None
+                connect_state["round"] += 1
+                if runs > 0 and connect_state["round"] > runs + 1:
+                    print(f"[CRAFT] Completed {runs} run(s) — exiting.")
+                    connect_state["stop"] = True
+                else:
+                    if connect_state["csv_file"] is not None:
+                        connect_state["csv_file"].close()
+                    connect_state["t0"] = time.time()
+                    # round is always >= 2 here (round 1 is the warmup, handled
+                    # before the loop) -- recorded run numbers start at 1.
+                    connect_state["csv_file"], connect_state["csv_writer"] = _start_round_csv(
+                        eval_log, connect_state["round"] - 1, connect_state["t0"])
+
             time.sleep(0.001)
     except KeyboardInterrupt:
         pass
     finally:
+        if connect_state["csv_file"] is not None:
+            connect_state["csv_file"].close()
         mari.close_tui()
         mari.logger.close()
 

@@ -80,10 +80,7 @@ class MetricsTester:
         self.marilib.send_frame(node.address, payload)
 
     def handle_response_edge(self, frame: Frame):
-        """
-        Processes a metrics response frame.
-        This should be called when a LATENCY_DATA event is received.
-        """
+        """Processes a metrics response frame (call on a LATENCY_DATA event)."""
         node = self.marilib.gateway.get_node(frame.header.source)
         if not node:
             print(f"[red]Node not found: {frame.header.source:016x}[/]")
@@ -118,10 +115,7 @@ class MetricsTester:
         return payload
 
     def handle_response_cloud(self, frame: Frame, gateway: MariGateway, node: MariNode):
-        """
-        Processes a metrics response frame.
-        This should be called when a LATENCY_DATA event is received.
-        """
+        """Processes a metrics response frame (call on a LATENCY_DATA event)."""
         try:
             payload = MetricsProbePayload().from_bytes(frame.payload)
             if payload.type_ != DefaultPayloadType.METRICS_PROBE:
