@@ -1,27 +1,18 @@
-# MariLib 💫 👀 🐍
+# M-AuRA Related work version for Verifying Parties
 
-MariLib is a Python library to interact with a local [Mari](https://github.com/DotBots/mari) network.
-It connects to a Mari gateway via:
-- UART, using MarilibEdge
-- MQTT, using MarilibCloud
+## The Network Service 
+The network service plays the role of Relying Party and EDHOC Initiator.
+It initiates the whole process by sending EDHOC message1 to the gateway, which is carried in beacon and broadcast in the swarm.
+Once the nework service receives the attestation result from the verifier, it decides either to kick the node or allow the data exchange with the node based on the attestation result.
 
-## Example with TUI
-MariLib provides a stateful class with gateway and node information, network statistics, and a rich real-time TUI:
-
-[mari-edge-2.webm](https://github.com/user-attachments/assets/fe50f2ba-8e67-4522-8700-69730f8e3aee)
-
-To run with a gateway connected via UART:
-```bash
-# for example, using the Inria Argus MQTT broker
-(.venv) $ python examples/mari_edge.py -m mqtts://argus.paris.inria.fr:8883
-```
 You can see how it works using `examples/mari_edge.py --help`.
+The corresponding libraries are `marilib/marilib/marilib_edge.py` and `marilib/marilib/marilib_attest_rp.py`.
 
-To run with a gateway connected via MQTT:
-```bash
-# for example, using the Inria Argus MQTT broker
-(.venv) $ python examples/mari_cloud.py -n 0x0100 -m mqtts://argus.paris.inria.fr:8883
-```
+## The Verifier
+`marilib/examples/mari_remote_verifier.py`
+The corresponding library is `marilib/marilib/marilib_attest_verifier.py`
+
+Verifier receives the evidence from the network service, evaluates the evidence, and generates attestation results.
 
 ## Setup and dependencies
 To setup the environment, do:
@@ -31,25 +22,3 @@ $ python -m venv .venv
 $ source .venv/bin/activate
 (.venv) $ pip install -e .
 ```
-
-## Minimal example
-Here is a minimal example showcasing how to use MariLib:
-
-```python
-import time
-from marilib.marilib import MarilibEdge
-from marilib.serial_uart import get_default_port
-
-def main():
-    mari = MarilibEdge(lambda event, data: print(event.name, data), get_default_port())
-    while True:
-        for node in mari.gateway.nodes:
-            mari.send_frame(dst=node.address, payload=b"A" * 3)
-        statistics = [(f"{node.address:016X}", node.stats.received_rssi_dbm()) for node in mari.gateway.nodes]
-        print(f"Network statistics: {statistics}")
-        time.sleep(0.25)
-
-if __name__ == "__main__":
-    main()
-```
-See it in action in `examples/minimal.py`.
