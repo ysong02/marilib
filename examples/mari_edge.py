@@ -98,7 +98,7 @@ def _start_round_csv(eval_log: str | None, round_num: int, t0: float):
 # ========================= connect wire helpers ================================
 
 def _verify_connect_request(connect_bytes: bytes) -> bytes | None:
-    """Verify sigma_i against PK_O. Returns PK_i on success, None on failure."""
+    """Verify sigma_i against PK_O, returning PK_i on success or None on failure."""
     if len(connect_bytes) != CONNECT_SIZE:
         return None
     # bytearray -> bytes: the cryptography library rejects bytearray slices.
@@ -125,7 +125,7 @@ def _build_connect_reply(challenge: bytes) -> bytes:
 
 
 def _derive_k_ij(pk_i: bytes) -> bytes:
-    """ECDH(EDGE_X25519_PRIVATE_KEY, PK_i). Unused downstream, kept for protocol fidelity."""
+    """Derives the ECDH shared secret from EDGE_X25519_PRIVATE_KEY and PK_i, unused downstream but kept for protocol fidelity."""
     peer = x25519.X25519PublicKey.from_public_bytes(pk_i)
     return _edge_x25519_private_key.exchange(peer)
 
@@ -406,10 +406,9 @@ def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log, round_timeou
             mari.update()
             now = time.time()
 
-            # Retry the connect reply for nodes that haven't sent an attest tag yet.
-            # No per-node give-up cap: keep retrying indefinitely -- --round-timeout
-            # below is the only thing that ever force-reboots a round, so one slow
-            # or lossy node no longer torches the whole round for everyone else.
+            # Retry the connect reply indefinitely for nodes that haven't sent an attest tag yet,
+            # with no per-node give-up cap, since round-timeout below is the only thing that ever
+            # force-reboots a round.
             for node_id, (reply, last_sent, retry_count) in list(connect_state["pending_reply"].items()):
                 if now - last_sent >= CONNECT_REPLY_RETRY_INTERVAL:
                     mari.send_edhoc(EDHOC_MSG2, node_id, reply)

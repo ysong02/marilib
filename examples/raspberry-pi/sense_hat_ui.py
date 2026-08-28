@@ -1,4 +1,4 @@
-# Raspberry Pi only. Emulator: apt install python3-gi python3-gi-cairo && pip install sense-emu. Real hardware: apt install sense-hat.
+# Raspberry Pi only, needing apt install python3-gi python3-gi-cairo && pip install sense-emu for the emulator or apt install sense-hat on real hardware.
 
 from sense_emu import SenseHat
 import threading

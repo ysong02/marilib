@@ -26,8 +26,7 @@ TOPIC_RESULT             = "/craft/attest_result"
 CHALLENGE_SIZE = 8
 ATTEST_TAG_SIZE = 32
 
-# One static key for the whole testbed. Must match SEDA_SHARED_KEY in
-# generate_craft_keys.py / CRAFT_SEDA_SHARED_KEY in attestation.c.
+# One static key for the whole testbed, must match SEDA_SHARED_KEY in generate_craft_keys.py and CRAFT_SEDA_SHARED_KEY in attestation.c.
 SEDA_SHARED_KEY = bytes.fromhex("3d0cf16e45fb5835f2ec73f339c26df919c5fadedee09aecd0f07b27612178e3")
 
 # Matches test_hash[] in app/03app_node/attestation.c
