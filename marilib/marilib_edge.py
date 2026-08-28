@@ -41,6 +41,8 @@ class MarilibEdge(MarilibBase):
     metrics_tester: MetricsTester | None = None
     metrics_probe_period: float | None = None
 
+    reboot_seq: int = field(default=0, repr=False)
+
     started_ts: datetime = field(default_factory=datetime.now)
     last_received_serial_data_ts: datetime = field(default_factory=datetime.now)
     last_received_mqtt_data_ts: datetime = field(default_factory=datetime.now)
@@ -267,8 +269,14 @@ class MarilibEdge(MarilibBase):
         self.serial_interface.send_data(buf)
 
     def send_reboot_all(self):
-        """Broadcast a reboot command to all nodes via the gateway and clear the association table."""
-        self.serial_interface.send_data(bytes([EdgeEvent.REBOOT_ALL]))
+        """Broadcast a reboot command to all nodes via the gateway and clear the association table.
+
+        Carries a sequence number (0-255, wraps) so a node that already acted on
+        this campaign's reboot can recognize and ignore late duplicate copies of
+        the same broadcast instead of resetting again mid-attestation.
+        """
+        self.reboot_seq = (self.reboot_seq + 1) % 256
+        self.serial_interface.send_data(bytes([EdgeEvent.REBOOT_ALL, self.reboot_seq]))
 
     def send_attestation_to_cloud(self, node_id: int, asn_dl: int, asn_ul: int, evidence_cbor: bytes, attestation_binder: bytes):
         """Forwards attestation evidence extracted from EDHOC EAD4 to the cloud verifier via MQTT."""

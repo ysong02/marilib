@@ -3,8 +3,8 @@
 Protocol:
   - /craft/challenge_request : edge -> verifier, CBOR {node_id}
   - /craft/challenge_response: verifier -> edge, CBOR {node_id, challenge}
-  - /craft/attest            : edge -> verifier, CBOR {node_id, tag}
-  - /craft/attest_result     : verifier -> edge, CBOR {node_id, result}
+  - /craft/attest            : edge -> verifier, CBOR {node_id, tag, round}
+  - /craft/attest_result     : verifier -> edge, CBOR {node_id, result, round}
 """
 
 import hmac
@@ -152,14 +152,15 @@ def main(mqtt_url: str):
         elif msg.topic == TOPIC_ATTEST:
             node_id = payload.get("node_id")
             tag     = payload.get("tag")
-            if node_id is None or tag is None:
+            round_num = payload.get("round")
+            if node_id is None or tag is None or round_num is None:
                 print("[VERIFIER] Incomplete attest payload")
                 return
             node_id = int(node_id)
             tag     = bytes(tag)
             result  = verifier.verify_attest(node_id, tag)
 
-            result_msg = cbor2.dumps({"node_id": node_id, "result": result})
+            result_msg = cbor2.dumps({"node_id": node_id, "result": result, "round": round_num})
             c.publish(TOPIC_RESULT, result_msg)
 
             s = verifier.stats

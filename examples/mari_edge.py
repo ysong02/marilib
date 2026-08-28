@@ -3,6 +3,7 @@
 import csv
 import os
 import struct
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +42,6 @@ SIG_EXPIRATION = 0xFFFFFFFF  # far-future constant, see attestation.c
 
 # Must stay below the node's CONNECT_REPLY_TIMEOUT_SLOTS (app/03app_node/main.c).
 CONNECT_REPLY_RETRY_INTERVAL = 2.0
-CONNECT_REPLY_MAX_RETRIES    = 5
 
 MQTT_TOPIC_CHALLENGE_REQUEST  = "/craft/challenge_request"
 MQTT_TOPIC_CHALLENGE_RESPONSE = "/craft/challenge_response"
@@ -49,6 +49,25 @@ MQTT_TOPIC_ATTEST             = "/craft/attest"
 MQTT_TOPIC_ATTEST_RESULT      = "/craft/attest_result"
 
 CHALLENGE_REQUEST_TIMEOUT = 3.0
+
+# Only kick a node off the mesh after this many attestation failures in a row
+# (across rounds) -- a lone fail is more likely transient congestion than a
+# compromised node, and kicking mid-round just makes it re-contend for the
+# join slot for nothing (it's already marked attested for this round).
+KICK_AFTER_N_FAILURES = 3
+
+# Mirrors mr_event_tag_t in mari/models.h -- only used to label NODE_LEFT reasons.
+LEFT_REASON_NAMES = {
+    0: "none",
+    1: "handover",
+    2: "out_of_sync",
+    3: "peer_lost",  # deprecated
+    4: "gateway_full",
+    5: "peer_lost_timeout",
+    6: "peer_lost_bloom",
+    7: "handover_failed",
+    8: "attestation_failed",
+}
 
 _operator_public_key = ed25519.Ed25519PublicKey.from_public_bytes(OPERATOR_PUBLIC_KEY)
 _edge_x25519_private_key = x25519.X25519PrivateKey.from_private_bytes(EDGE_X25519_PRIVATE_KEY)
@@ -70,8 +89,8 @@ def _start_round_csv(eval_log: str | None, round_num: int, t0: float):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     f = open(path, "w", newline="")
     writer = csv.writer(f)
-    writer.writerow(["type", "timestamp", "node_id", "elapsed_s"])
-    writer.writerow(["t0", f"{t0:.6f}", "", ""])
+    writer.writerow(["type", "timestamp", "node_id", "elapsed_s", "latency_s"])
+    writer.writerow(["t0", f"{t0:.6f}", "", "", ""])
     f.flush()
     return f, writer
 
@@ -115,12 +134,15 @@ def _derive_k_ij(pk_i: bytes) -> bytes:
 
 def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dict, target_nodes: int, reboot_wait: float):
     if event == EdgeEvent.NODE_JOINED:
-        if connect_state["csv_writer"] is not None and connect_state["t0"] is not None:
-            now = time.time()
-            elapsed = now - connect_state["t0"]
-            connect_state["csv_writer"].writerow(
-                ["node_joined", f"{now:.6f}", f"0x{event_data.address:016X}", f"{elapsed:.3f}"])
-            connect_state["csv_file"].flush()
+        # csv_file/csv_writer are also swapped from the main thread on round rollover
+        # (see main()); this runs on the serial reader thread, so it needs the same lock.
+        with connect_state["csv_lock"]:
+            if connect_state["csv_writer"] is not None and connect_state["t0"] is not None:
+                now = time.time()
+                elapsed = now - connect_state["t0"]
+                connect_state["csv_writer"].writerow(
+                    ["node_joined", f"{now:.6f}", f"0x{event_data.address:016X}", f"{elapsed:.3f}", ""])
+                connect_state["csv_file"].flush()
 
     elif event == EdgeEvent.NODE_LEFT:
         connect_state["sessions"].pop(event_data.address, None)
@@ -128,15 +150,30 @@ def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dic
         connect_state["pending_challenge"].pop(event_data.address, None)
         connect_state["completed"].discard(event_data.address)
 
+        reason = LEFT_REASON_NAMES.get(event_data.left_reason, f"unknown({event_data.left_reason})")
+        connect_state["left_reasons"][reason] = connect_state["left_reasons"].get(reason, 0) + 1
+
     elif event == EdgeEvent.EDHOC:
         subtype, node_id, msg_bytes, _asn_dl, _asn_ul = event_data
 
         if subtype == EDHOC_MSG1:
+            if node_id in connect_state["attested"]:
+                return  # already attested this round; stray retransmission needs no action
+
             # No cached-reply fast path: a stale reply could recycle a consumed challenge, so always re-verify.
             pending = connect_state["pending_challenge"].get(node_id)
             if pending is not None and pending["request"] == msg_bytes:
                 if time.time() - pending["ts"] < CHALLENGE_REQUEST_TIMEOUT:
                     return  # request already in flight
+
+            # Duplicate of a request already answered this cycle: resend the existing
+            # reply instead of fetching a fresh challenge, which would invalidate the
+            # challenge the node may already have in flight for its attest tag.
+            session = connect_state["sessions"].get(node_id)
+            if session is not None and session["request"] == msg_bytes:
+                mari.send_edhoc(EDHOC_MSG2, node_id, session["reply"])
+                connect_state["pending_reply"][node_id] = (session["reply"], time.time(), 0)
+                return
 
             pk_i = _verify_connect_request(msg_bytes)
             if pk_i is None:
@@ -166,15 +203,23 @@ def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dic
                 return
 
             connect_state["completed"].add(node_id)
-            _send_attest_to_verifier(mari, node_id, msg_bytes)
+            _send_attest_to_verifier(mari, node_id, msg_bytes, connect_state["round"])
 
     elif event == EdgeEvent.ATTEST_RESULT:
-        node_id, result = event_data
-        if not result:
-            mari._send_kick_to_gateway(node_id)
+        node_id, result, result_round = event_data
+        if result_round != connect_state["round"]:
+            return  # late result from an already-rebooted round; drop instead of miscrediting
+
+        if result:
+            connect_state["fail_counts"].pop(node_id, None)
+        else:
+            fails = connect_state["fail_counts"].get(node_id, 0) + 1
+            connect_state["fail_counts"][node_id] = fails
+            if fails >= KICK_AFTER_N_FAILURES:
+                mari._send_kick_to_gateway(node_id)
 
         if node_id in connect_state["attested"]:
-            return  # duplicate/late result (e.g. straggler from a prior round)
+            return  # duplicate result
         connect_state["attested"].add(node_id)
         count = len(connect_state["attested"])
         ts = datetime.now().strftime("%H:%M:%S")
@@ -183,6 +228,9 @@ def on_event(event: EdgeEvent, event_data, mari: MarilibEdge, connect_state: dic
 
         if count >= target_nodes and connect_state["reboot_at"] is None:
             connect_state["reboot_at"] = time.time() + reboot_wait
+            if connect_state["t0"] is not None:
+                reasons = ", ".join(f"{k}={v}" for k, v in sorted(dict(connect_state["left_reasons"]).items())) or "none"
+                print(f"[CRAFT] {round_label} finished in {time.time() - connect_state['t0']:.1f}s (left reasons: {reasons})")
 
 
 def _request_challenge_from_verifier(mari: MarilibEdge, node_id: int) -> bool:
@@ -215,14 +263,25 @@ def _wire_challenge_response_subscription(mari: MarilibEdge, connect_state: dict
         if pending is None:
             return  # stale/duplicate response, or node already gave up
 
+        now = time.time()
         reply = _build_connect_reply(challenge)
         connect_state["sessions"][node_id] = {
             "request":   pending["request"],
             "reply":     reply,
             "challenge": challenge,
         }
-        connect_state["pending_reply"][node_id] = (reply, time.time(), 0)
+        connect_state["pending_reply"][node_id] = (reply, now, 0)
         mari.send_edhoc(EDHOC_MSG2, node_id, reply)
+
+        # Time from EDHOC_MSG1 receipt to EDHOC_MSG2 sent -- the window the node's
+        # own CONNECT_REPLY_TIMEOUT_SLOTS (~10.7s) races against before it self-resets.
+        latency = now - pending["ts"]
+        with connect_state["csv_lock"]:
+            if connect_state["csv_writer"] is not None and connect_state["t0"] is not None:
+                elapsed = now - connect_state["t0"]
+                connect_state["csv_writer"].writerow(
+                    ["connect_reply", f"{now:.6f}", f"0x{node_id:016X}", f"{elapsed:.3f}", f"{latency:.3f}"])
+                connect_state["csv_file"].flush()
 
     def _subscribe():
         client.message_callback_add(MQTT_TOPIC_CHALLENGE_RESPONSE, _on_challenge_response)
@@ -239,11 +298,11 @@ def _wire_challenge_response_subscription(mari: MarilibEdge, connect_state: dict
     _subscribe()
 
 
-def _send_attest_to_verifier(mari: MarilibEdge, node_id: int, tag: bytes) -> None:
-    """Send the attest HMAC tag to the verifier via MQTT."""
+def _send_attest_to_verifier(mari: MarilibEdge, node_id: int, tag: bytes, round_num: int) -> None:
+    """Send the attest HMAC tag to the verifier via MQTT, tagged with the requesting round."""
     if not mari.uses_mqtt:
         return
-    payload = cbor2.dumps({"node_id": node_id, "tag": tag})
+    payload = cbor2.dumps({"node_id": node_id, "tag": tag, "round": round_num})
     try:
         mari.mqtt_interface.client.publish(MQTT_TOPIC_ATTEST, payload)
     except Exception as e:
@@ -259,10 +318,11 @@ def _wire_attest_result_subscription(mari: MarilibEdge, on_event_wrapper) -> Non
             payload = cbor2.loads(message.payload)
             node_id = int(payload["node_id"])
             result  = bool(payload["result"])
+            round_num = int(payload["round"])
         except Exception as e:
             print(f"[CRAFT] Malformed attest_result payload: {e}")
             return
-        on_event_wrapper(EdgeEvent.ATTEST_RESULT, (node_id, result))
+        on_event_wrapper(EdgeEvent.ATTEST_RESULT, (node_id, result, round_num))
 
     def _subscribe():
         client.message_callback_add(MQTT_TOPIC_ATTEST_RESULT, _on_attest_result)
@@ -291,7 +351,9 @@ def _wire_attest_result_subscription(mari: MarilibEdge, on_event_wrapper) -> Non
 @click.option("--eval-log", type=click.Path(), default=None,
               help="CSV prefix for per-run joining-time logs, e.g. craft_nodes_010/craft_run.csv "
                    "-> craft_nodes_010/craft_run_001.csv, _002.csv, ... (one file per run)")
-def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log):
+@click.option("--round-timeout", type=float, default=45.0, show_default=True,
+              help="Force reboot_all if a round hasn't finished within this many seconds (0 = disabled)")
+def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log, round_timeout):
     """CRAFT+SEDA Edge: connect relying party + attest relay (node = initiator)."""
 
     connect_state: dict = {
@@ -300,11 +362,14 @@ def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log):
         "pending_challenge": {},
         "completed":         set(),
         "attested":          set(),
+        "left_reasons":      {},  # reset every round, see main loop
+        "fail_counts":       {},  # persists across rounds -- see KICK_AFTER_N_FAILURES
         "reboot_at":         None,
         "round":             1,
         "stop":              False,
         "csv_file":          None,
         "csv_writer":        None,
+        "csv_lock":          threading.Lock(),
         "t0":                None,
     }
 
@@ -341,17 +406,27 @@ def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log):
             mari.update()
             now = time.time()
 
-            # Retry the connect reply for nodes that haven't sent an attest tag yet
+            # Retry the connect reply for nodes that haven't sent an attest tag yet.
+            # No per-node give-up cap: keep retrying indefinitely -- --round-timeout
+            # below is the only thing that ever force-reboots a round, so one slow
+            # or lossy node no longer torches the whole round for everyone else.
             for node_id, (reply, last_sent, retry_count) in list(connect_state["pending_reply"].items()):
-                if retry_count >= CONNECT_REPLY_MAX_RETRIES:
-                    print(f"[CRAFT] 0x{node_id:016X} unreachable after {CONNECT_REPLY_MAX_RETRIES} tries -- rebooting round")
-                    connect_state["pending_reply"].pop(node_id, None)
-                    if connect_state["reboot_at"] is None:
-                        connect_state["reboot_at"] = now
-                    continue
                 if now - last_sent >= CONNECT_REPLY_RETRY_INTERVAL:
                     mari.send_edhoc(EDHOC_MSG2, node_id, reply)
                     connect_state["pending_reply"][node_id] = (reply, now, retry_count + 1)
+
+            # A round can get stuck without ever entering the retry loop above
+            # (e.g. a node that never sends a connect request this round at all),
+            # so this is the sole backstop: force a reboot if the round has simply
+            # run too long, regardless of what's stuck.
+            if (round_timeout > 0 and connect_state["reboot_at"] is None
+                    and connect_state["t0"] is not None
+                    and now - connect_state["t0"] > round_timeout):
+                reasons = ", ".join(f"{k}={v}" for k, v in sorted(dict(connect_state["left_reasons"]).items())) or "none"
+                print(f"[CRAFT] round timed out after {round_timeout:.0f}s "
+                      f"({len(connect_state['attested'])}/{target_nodes} attested) -- rebooting "
+                      f"(left reasons: {reasons})")
+                connect_state["reboot_at"] = now
 
             # Fire the reboot once the target node count has attested (see on_event),
             # from the main loop rather than the MQTT callback thread.
@@ -359,19 +434,23 @@ def main(port, mqtt_url, target_nodes, runs, reboot_wait, eval_log):
                 mari.send_reboot_all()
                 connect_state["attested"] = set()
                 connect_state["completed"] = set()
+                connect_state["left_reasons"] = {}
                 connect_state["reboot_at"] = None
                 connect_state["round"] += 1
                 if runs > 0 and connect_state["round"] > runs + 1:
                     print(f"[CRAFT] Completed {runs} run(s) — exiting.")
                     connect_state["stop"] = True
                 else:
-                    if connect_state["csv_file"] is not None:
-                        connect_state["csv_file"].close()
                     connect_state["t0"] = time.time()
                     # round is always >= 2 here (round 1 is the warmup, handled
                     # before the loop) -- recorded run numbers start at 1.
-                    connect_state["csv_file"], connect_state["csv_writer"] = _start_round_csv(
+                    new_file, new_writer = _start_round_csv(
                         eval_log, connect_state["round"] - 1, connect_state["t0"])
+                    with connect_state["csv_lock"]:
+                        old_file = connect_state["csv_file"]
+                        connect_state["csv_file"], connect_state["csv_writer"] = new_file, new_writer
+                    if old_file is not None:
+                        old_file.close()
 
             time.sleep(0.001)
     except KeyboardInterrupt:
