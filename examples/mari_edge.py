@@ -50,8 +50,7 @@ CRED_R = bytes([
     0x7a, 0xfd, 0xa6, 0x4f, 0xcd, 0xe0, 0x10, 0x8c, 0x22, 0x4c, 0x51, 0xea, 0xbf, 0x60, 0x72,
 ])
 
-# How often to rotate msg1 (new ephemeral key for forward secrecy).
-# Must be longer than the worst-case EDHOC exchange time (beacon interval * join latency).
+# Msg1 rotation interval for forward secrecy; must exceed the worst-case EDHOC exchange time.
 EDHOC_MSG1_RESEND_INTERVAL = 300.0
 
 
@@ -257,10 +256,7 @@ def main(port: str | None, mqtt_url: str, metrics_probe_interval: float, log_dir
                     edhoc_state["pending_msg3"][node_id] = (msg3, now, retry_count + 1)
                     print(f"[EDHOC] msg3 retry #{retry_count + 1}/{MSG3_MAX_RETRIES} → node 0x{node_id:016X}")
 
-            # Rotate msg1: fresh ephemeral key, gateway overwrites old bytes next beacon.
-            # Previous initiator is kept one cycle as fallback for late-arriving msg2.
-            # Do NOT clear sessions: nodes that already have msg3 in flight must still be
-            # able to complete with msg4.  Sessions are removed individually when msg4 arrives.
+            # Rotate msg1, keeping the previous initiator one cycle as fallback, but leave sessions alone since nodes with msg3 in flight still need to complete msg4.
             if now - edhoc_state["last_msg1_sent"] >= EDHOC_MSG1_RESEND_INTERVAL:
                 initiator, msg1 = _init_edhoc(mari)
                 edhoc_state["prev_initiator"] = edhoc_state["initiator"]
