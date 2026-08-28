@@ -51,9 +51,7 @@ EDHOC_MSG3 = 3
 MSG3_RETRY_INTERVAL = 2.0
 MSG3_MAX_RETRIES    = 30
 
-# Downlink tag for the msg3 ack, sent the instant msg3 verifies successfully so the
-# node can stop retransmitting instead of guessing. Must match MAURA_MSG3_ACK_TAG in
-# app/03app_node/main.c.
+# Downlink tag for the msg3 ack, sent the instant msg3 verifies so the node can stop retransmitting instead of guessing; must match MAURA_MSG3_ACK_TAG in app/03app_node/main.c.
 MSG3_ACK_TAG = 0xAC
 
 # MQTT topics for nonce request/response, evidence forwarding, and result retrieval
@@ -67,8 +65,7 @@ MQTT_TOPIC_ATTEST_RESULT  = "/maura/attest_result"
 # low milliseconds under normal operation).
 NONCE_REQUEST_TIMEOUT = 3.0
 
-# Edge = EDHOC Responder.
-# Uses the credentials previously held by the mari node (roles reversed).
+# Edge is the EDHOC Responder here, using the credentials previously held by the mari node since the roles are reversed.
 R = bytes([
     0x72, 0xcc, 0x47, 0x61, 0xdb, 0xd4, 0xc7, 0x8f, 0x75, 0x89, 0x31, 0xaa, 0x58, 0x9d, 0x34, 0x8d,
     0x1e, 0xf8, 0x74, 0xa7, 0xe3, 0x03, 0xed, 0xe2, 0xf1, 0x40, 0xdc, 0xf3, 0xe6, 0xaa, 0x4a, 0xac,
@@ -153,21 +150,9 @@ def on_event(
         if subtype == EDHOC_MSG1:
             # Node sent msg1 in join request -> create responder session
 
-            # The node caches msg1 once and the mari MAC layer resends the identical
-            # join request (byte-for-byte) on its own backoff schedule until a join
-            # response actually arrives -- so a repeat arrival with the SAME bytes is
-            # just a retransmit, not a new session, and we should resend the cached
-            # msg2 rather than reset (multi-node contention can otherwise make retries
-            # arrive faster than a msg2 round-trip completes, so the session keeps
-            # getting reset and never converges to msg3).
-            #
-            # But if the node rebooted (e.g. it gave up waiting for msg2 and retried
-            # from scratch -- see MSG2_TIMEOUT_SLOTS in app/03app_node/main.c), it
-            # generates a genuinely new msg1 with a fresh ephemeral key: different
-            # bytes, same node_id. Treating that as a stale retry too (matching only
-            # on node_id) means resending an old msg2 the node's new session can never
-            # verify -- it just reboots again ~6s later, forever, and nothing ever
-            # reaches msg3. So only short-circuit when the bytes actually match.
+            # Only treat a repeat msg1 as a stale retry to resend the cached msg2 when its bytes
+            # exactly match the cached one, since a rebooted node sends a genuinely new msg1 with
+            # a fresh key that an old msg2 could never verify.
             existing = edhoc_state["sessions"].get(node_id)
             if existing is not None and existing["msg1"] == edhoc_bytes:
                 mari.send_edhoc(EDHOC_MSG2, node_id, existing["msg2"])
@@ -459,13 +444,9 @@ def main(port, mqtt_url, metrics_probe_interval, log_dir, eval_log,
     exit_on_done = auto_exit or (runs > 1)
     result_subscription_wired = False
 
-    # Wire the attest_result and nonce_response subscriptions before the first round's
-    # reboot_wait sleep below. Otherwise nodes that finish EDHOC + attestation (or send
-    # msg1 needing a nonce) during that blocking sleep -- before the per-round loop, where
-    # these used to be wired, ever runs -- get their message published while mari_edge
-    # isn't subscribed yet, and MQTT doesn't back-deliver messages published before a
-    # subscription existed, so the message is silently lost (this bit us once already
-    # for attest_result; wiring nonce_response the same way here to avoid repeating it).
+    # Wire the attest_result and nonce_response subscriptions before the reboot_wait sleep
+    # below, since a node that finishes during that window would publish before mari_edge
+    # is subscribed and MQTT does not back-deliver missed messages.
     if mari.uses_mqtt:
         while not mari.mqtt_connected:
             mari.update()
